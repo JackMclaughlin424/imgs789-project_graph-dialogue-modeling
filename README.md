@@ -10,7 +10,7 @@ Professor: Dr. Bartosz Krawczyk
 
 ## Prior/Inspiring Work
 
-1. **Emotion Rendering for Conversational Speech Synthesis with Heterogeneous Graph-Based Context Modeling**
+1. Main: **Emotion Rendering for Conversational Speech Synthesis with Heterogeneous Graph-Based Context Modeling**
     - Paper: https://arxiv.org/html/2312.11947v1 
     - Code: https://github.com/walker-hyf/ECSS 
 
