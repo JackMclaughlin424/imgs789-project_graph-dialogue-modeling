@@ -5,10 +5,20 @@ Professor: Dr. Bartosz Krawczyk
 
 ## Contribution 
 1. Apply graph-based context modeling to task of style prompt generation
-2. Transfer learning: fine tune on custom dataset (ParaSpeechCaps + StyleTalk) for style description generation.
+2. Transfer learning: fine tune LLM to learn a niche task on a custom dataset (ParaSpeechCaps + StyleTalk).
 3. Evaluate against non-graph based implementation (capstone project)
 
-This project is a comparison study between two model architectures designed to learn the task of context-aware style prompt generation.
+This project is a comparison study between two model architectures designed to learn the task of context-aware style prompt generation. The baseline architecture is the model I implemented for my capstone, and the new architecture I adapted from [Liu et al. 2023](https://arxiv.org/abs/2312.11947v1).
+
+**New Code**
+
+```DialogueGraph.py``` is fully newly implemented for this project.
+
+**Repurposed Code**
+
+The following files contain code with few or no changes from the code used for my capstone:
+
+- 
 
 ## Background
 
@@ -16,7 +26,9 @@ Text-to-speech (TTS) is an important assistive technology for people who have lo
 
 ## Methodology (Tentative)
 
-ConvoStyleGraph will represent the turns in conversation as nodes in a graph, which are connected based on relevance. Using both audio and textual modalities will incorporate rich prosodic and semantic information to inform the style of speech in the conversation so far. A final embedding will be produced from this graph, then this will be passed through a transformer mapping layer  
+ConvoStyleGraph will represent the turns in conversation as nodes in a graph, which are connected based on relevance. The presence of both audio and textual modalities will incorporate rich prosodic and semantic information to inform the style of speech in the conversation so far. 
+
+A final embedding will be produced from this graph, then this will be passed through a transformer mapping layer which projects the dialogue into the word embedding space of an LLM. The final embedding will be used as a learned prefix vector to condition the LLM to produce style prompt suggestions.
 
 **Dataset**
 
