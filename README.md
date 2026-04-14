@@ -1,4 +1,4 @@
-# ConvoStyleGraph: Modeling Dialogue Context as Heterogenous Graph for Better Style Description Generation
+# ConvoStyleGraph: Modeling Dialogue Context as Multi-scale Graph for Better Style Description Generation
 
 Main Contributor: Jack McLaughlin
 Professor: Dr. Bartosz Krawczyk
@@ -8,7 +8,7 @@ Professor: Dr. Bartosz Krawczyk
 2. Transfer learning: fine tune LLM to learn a niche task on a custom dataset (ParaSpeechCaps + StyleTalk).
 3. Evaluate against non-graph based implementation (capstone project)
 
-This project is a comparison study between two model architectures designed to learn the task of context-aware style prompt generation. The baseline architecture is the model I implemented for my capstone, and the new architecture I adapted from [Liu et al. 2023](https://arxiv.org/abs/2312.11947v1).
+This project is a comparison study between two model architectures designed to learn the task of context-aware style prompt generation. The baseline architecture is the model I implemented for my capstone, and the other architecture is one I adapted for this project from [Li et al. 2022](https://dl.acm.org/doi/epdf/10.1145/3503161.3547831).
 
 **New Code**
 
@@ -31,6 +31,12 @@ ConvoStyleGraph will represent the turns in conversation as nodes in a graph, wh
 A final embedding will be produced from this graph, then this will be passed through a transformer mapping layer which projects the dialogue into the word embedding space of an LLM. The final embedding will be used as a learned prefix vector to condition the LLM to produce style prompt suggestions.
 
 **Dataset**
+
+Expresso & ParaSpeechCaps
+- Expresso contains 23 hours of conversational speech data, ParaSpeechCaps provides rich style annotations for these conversations
+
+StyleTalk
+- 7 hours of synthetic conversational speech with style annotations. Much simpler than Expresso & ParaSpeechCaps
 
 **Model**
 
