@@ -32,11 +32,14 @@ A final embedding will be produced from this graph, then this will be passed thr
 
 **Dataset**
 
-Expresso & ParaSpeechCaps
-- Expresso contains 23 hours of conversational speech data, ParaSpeechCaps provides rich style annotations for these conversations
+English Conversation Corpus
+- Pretraining style encoders: https://github.com/thuhcsi/english-conversation-corpus
+
+Expresso+ParaSpeechCaps
+- Expresso contains 23 hours of conversational speech data, ParaSpeechCaps provides rich style annotations for these conversations (1-2 detailed style descriptions per utterance)
 
 StyleTalk
-- 7 hours of synthetic conversational speech with style annotations. Much simpler than Expresso & ParaSpeechCaps
+- 7 hours of synthetic conversational speech with style annotations. "Easier" than Expresso+ParaSpeechCaps
 
 **Model**
 
@@ -44,7 +47,11 @@ StyleTalk
 
 ## Prior/Inspiring Work
 
-- **Main**: Inferring Speaking Styles from Multi-modal ConversationalContext by Multi-scale Relational Graph Convolutional Networks
+- **Main**: ENHANCING SPEAKING STYLES IN CONVERSATIONAL TEXT-TO-SPEECH SYNTHESIS WITH GRAPH-BASED MULTI-MODAL CONTEXT MODELING
+    - Paper: https://arxiv.org/pdf/2106.06233
+    - code: https://github.com/thuhcsi/mm2022-conversational-tts/tree/master?tab=readme-ov-file
+
+- Inferring Speaking Styles from Multi-modal ConversationalContext by Multi-scale Relational Graph Convolutional Networks
     - Paper: https://dl.acm.org/doi/epdf/10.1145/3503161.3547831
     - Code: https://github.com/thuhcsi/mm2022-conversational-tts
 

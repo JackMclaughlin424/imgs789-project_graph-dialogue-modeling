@@ -16,3 +16,5 @@ src/eda/gaps.csv
 *.DS_Store
 
 mm2022-conversational-tts/
+mst-fastspeech2/
+english-conversation-corpus/
