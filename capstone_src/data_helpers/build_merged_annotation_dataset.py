@@ -205,6 +205,7 @@ def add_styletalk(psc_df, st_df):
     """Map styletalk columns onto psc columns for easier analysis and training"""
     
     MAIN_COLS = list(psc_df.columns)
+    STYLETALK_EXTRA_COLS = ['emotion', 'volume']
     TYPE_COL = 'record_type'
 
     
@@ -224,7 +225,8 @@ def add_styletalk(psc_df, st_df):
         if context and context.lower() != 'nan':
             context_turns = parse_context_turns(context, diag_id)
             for turn in context_turns:
-                r = {col: pd.NA for col in MAIN_COLS}
+                r = {col: pd.NA for col in MAIN_COLS + STYLETALK_EXTRA_COLS}
+
                 r[TYPE_COL]        = 'text_only'
                 r['source']        = 'styletalk'
                 r['conv_id']      = diag_id
@@ -247,7 +249,8 @@ def add_styletalk(psc_df, st_df):
         
         cur_speaker_label = pd.NA
         if pd.notna(curr_audio):
-            r = {col: pd.NA for col in MAIN_COLS}
+            r = {col: pd.NA for col in MAIN_COLS + STYLETALK_EXTRA_COLS}
+
             
             
             r[TYPE_COL]                 = 'audio'
@@ -262,6 +265,7 @@ def add_styletalk(psc_df, st_df):
             
             transcription = row.get('curr_text')
             
+            
             match = re.match(r'^([AB])\s*:\s*', transcription)
             cur_speaker_label = match.group(1) if match else pd.NA
             if match:
@@ -271,6 +275,9 @@ def add_styletalk(psc_df, st_df):
             r['transcription']          = transcription
             r['speakerid']              = cur_speaker_label
             r['speaking_rate']          = row.get('curr_speed')
+            r['emotion']       = row.get('curr_emotion')
+            r['volume']        = row.get('curr_volume')
+
             
             tags = build_tags(row.get('curr_emotion'),row.get('curr_speed'),row.get('curr_volume'))
             r['basic_tags']             = tags
@@ -287,7 +294,8 @@ def add_styletalk(psc_df, st_df):
         res_audio = row.get('res_audio_id')
         
         if pd.notna(res_audio):
-            r = {col: pd.NA for col in MAIN_COLS}
+            r = {col: pd.NA for col in MAIN_COLS + STYLETALK_EXTRA_COLS}
+
             r[TYPE_COL]             = 'audio'
             r['source']             = 'styletalk'
             r['conv_id']           = diag_id
@@ -312,7 +320,9 @@ def add_styletalk(psc_df, st_df):
             r['speakerid']              = res_speaker_label
     
             r['speaking_rate']      = row.get('res_speed')
-            
+            r['emotion']       = row.get('res_emotion')
+            r['volume']        = row.get('res_volume')
+
             tags = build_tags(row.get('res_emotion'),row.get('res_speed'),row.get('res_volume'))
             r['basic_tags']             = tags
             r['all_tags']               = tags
@@ -326,10 +336,12 @@ def add_styletalk(psc_df, st_df):
             new_rows.append(r)
 
     # merge
-    new_df = pd.DataFrame(new_rows, columns=MAIN_COLS + [TYPE_COL])
+    new_df = pd.DataFrame(new_rows, columns=MAIN_COLS + [TYPE_COL] + STYLETALK_EXTRA_COLS)
+
     merged = pd.concat([psc_df, new_df], ignore_index=True)
 
-    all_cols = MAIN_COLS + [TYPE_COL]
+    all_cols = MAIN_COLS + [TYPE_COL] + STYLETALK_EXTRA_COLS
+
     for c in merged.columns:
         if c not in all_cols:
             all_cols.append(c)
@@ -344,17 +356,64 @@ def add_styletalk(psc_df, st_df):
     return merged
 
 
+def build_vocabulary(merged_df):
+    """Build vocab from explicit category columns rather than all_tags."""
+    import json
+
+    expresso_df = merged_df[merged_df["source"] == "expresso"]
+    st_audio_df = merged_df[(merged_df["source"] == "styletalk") & (merged_df["record_type"] == "audio")]
+
+    expresso_columns = {
+        "gender":        sorted(expresso_df["gender"].dropna().unique().tolist()),
+        "accent":        sorted(expresso_df["accent"].dropna().unique().tolist()),
+        "pitch":         sorted(expresso_df["pitch"].dropna().unique().tolist()),
+        "speaking_rate": sorted(expresso_df["speaking_rate"].dropna().unique().tolist()),
+        "noise": sorted(expresso_df["noise"].dropna().unique().tolist()),
+        "intrinsic_tags": sorted(expresso_df["intrinsic_tags"].explode().dropna().unique().tolist()),
+        "situational_tags": sorted(expresso_df["situational_tags"].explode().dropna().unique().tolist()),
+    }
+    styletalk_columns = {
+        "emotion":       sorted(st_audio_df["emotion"].dropna().unique().tolist()),
+        "volume":        sorted(st_audio_df["volume"].dropna().unique().tolist()),
+        "speaking_rate": sorted(st_audio_df["speaking_rate"].dropna().unique().tolist()),
+    }
+
+    def _build_source_vocab(columns):
+        # category → [tags]; a tag appearing in multiple categories is listed in each
+        return {cat: vals for cat, vals in columns.items()}
+
+    vocab = {
+        "expresso":  _build_source_vocab(expresso_columns),
+        "styletalk": _build_source_vocab(styletalk_columns),
+    }
+
+
+
+    out_path = "../eda/source_vocabularies.json"
+    with open(out_path, "w") as f:
+        json.dump(vocab, f, indent=2, sort_keys=True)
+
+    print(f"Saved vocabulary to {out_path}")
+    print(f"  expresso: {len(vocab['expresso'])} entries")
+    print(f"  styletalk: {len(vocab['styletalk'])} entries")
+
+    return vocab
+
+
 def main():
     df = initialize_expresso_df()
     
     df = add_conversation_index(df)
     
-    st_df =  pd.read_parquet("../data/processed/styletalk_with_audio_stats.parquet")
+    st_df = pd.read_parquet("../data/processed/styletalk_with_audio_stats.parquet")
     
     merged = add_styletalk(df, st_df)
     
-    OUT_PQ = "../data/processed/merged_PSC_StyleTalk_CLEANED.parquet"
+    OUT_PQ = "../data_TEMP/merged_PSC_StyleTalk_CLEANED.parquet"
     merged.to_parquet(OUT_PQ, index=False)
+    
+    build_vocabulary(merged)
+
     
     
 if __name__=="__main__":

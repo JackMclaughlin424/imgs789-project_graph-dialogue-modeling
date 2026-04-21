@@ -1,0 +1,62 @@
+{
+  "expresso": {
+    "accent": [
+      "american"
+    ],
+    "gender": [
+      "female",
+      "male"
+    ],
+    "intrinsic_tags": [
+      "american",
+      "authoritative",
+      "booming",
+      "crisp",
+      "enunciated",
+      "flowing",
+      "loud",
+      "nasal",
+      "shrill",
+      "silky",
+      "singsong"
+    ],
+    "noise": [
+      "clean environment",
+      "environment balanced in clarity",
+      "noisy environment",
+      "slightly clean environment",
+      "slightly noisy environment",
+      "very clean environment",
+      "very noisy environment"
+    ],
+    "pitch": [
+      "high-pitched"
+    ],
+    "speaking_rate": [
+      "fast speed",
+      "measured speed",
+      "slow speed"
+    ]
+  },
+  "styletalk": {
+    "emotion": [
+      "cheerful",
+      "excited",
+      "friendly",
+      "hopeful",
+      "neutral",
+      "sad",
+      "unfriendly"
+    ],
+    "speaking_rate": [
+      "fast",
+      "normal",
+      "slow"
+    ],
+    "volume": [
+      "loud",
+      "normal",
+      "quiet"
+    ]
+  }
+}
