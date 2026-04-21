@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from DialogueEncoder import SCFA, DialoguePooler
+from model.DialogueEncoder import SCFA, DialoguePooler
 
 
 # not really used, these are controlled via config parameters now
@@ -14,7 +14,7 @@ LLM_DIM  = 3072  # must match model's hidden_size
 
 def load_tinyllama(device: str = "cpu", torch_dtype=torch.float32):
     tokenizer = AutoTokenizer.from_pretrained(LLM_REPO)
-    model = AutoModelForCausalLM.from_pretrained(LLM_REPO, dtype=torch_dtype)
+    model = AutoModelForCausalLM.from_pretrained(LLM_REPO, torch_dtype=torch_dtype)
     model = model.to(device)
     model.eval()
     if tokenizer.pad_token is None:
@@ -50,18 +50,19 @@ class StylePromptHead(nn.Module):
         self.stream_compressors = nn.ModuleList([
             nn.Linear(d_model, d_model // 2) for _ in range(4)
         ])
-        self.fusion = nn.Sequential(
-            nn.Linear(d_model * 2, llm_dim),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-        )
-        self.norm = nn.LayerNorm(llm_dim)
+        
+
+        self.stream_to_llm = nn.ModuleList([
+            nn.Linear(d_model // 2, llm_dim) for _ in range(4)
+        ])
+
+
 
         self.prefix_const = nn.Parameter(torch.randn(num_prefix_tokens, llm_dim) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=llm_dim,
             nhead=nhead,
-            dim_feedforward=llm_dim * 2,
+            # dim_feedforward=llm_dim * 2,  # use default 2048, matching papers
             dropout=dropout,
             batch_first=True,
         )
@@ -74,17 +75,18 @@ class StylePromptHead(nn.Module):
         B, D = dialogue_vec.shape
         d_model = D // 4
 
-        # split back into the 4 SCFA streams and compress each independently
+        # split back into the 4 SCFA streams and compress each independently 
+        # to create distinct context tokens
         streams    = dialogue_vec.split(d_model, dim=-1)
         compressed = [F.relu(comp(s)) for comp, s in zip(self.stream_compressors, streams)]
-        z = self.norm(self.fusion(torch.cat(compressed, dim=-1)))  # (B, LLM_DIM)
+        ctx_tokens = torch.stack([proj(c) for proj, c in zip(self.stream_to_llm, compressed)], dim=1)  # (B, 4, llm_dim)
 
         # z sits at position 0; learnable constants learn to query it
-        consts = self.prefix_const.unsqueeze(0).expand(B, -1, -1)  # (B, K, LLM_DIM)
-        seq    = torch.cat([z.unsqueeze(1), consts], dim=1)         # (B, 1+K, LLM_DIM)
-        out    = self.transformer(seq)                               # (B, 1+K, LLM_DIM)
+        consts     = self.prefix_const.unsqueeze(0).expand(B, -1, -1)
+        seq        = torch.cat([ctx_tokens, consts], dim=1)   # (B, 4+K, llm_dim)
+        out        = self.transformer(seq)
+        return out[:, 4:, :]# drop z position, return K prefix vectors
 
-        return out[:, 1:, :]  # drop z position, return K prefix vectors
 
 
 class StylePromptGenerator(nn.Module):
@@ -107,6 +109,9 @@ class StylePromptGenerator(nn.Module):
         self.style_head     = style_head
         self.tokenizer      = tokenizer
         self.llm            = llm
+        # Silence the do_sample=False vs temperature/top_p conflict in GenerationConfig
+        self.llm.generation_config.temperature = None
+        self.llm.generation_config.top_p = None
         self.system_prompt  = system_prompt
         self.max_new_tokens = max_new_tokens
         self.max_prompt_tokens = max_prompt_tokens
@@ -149,6 +154,8 @@ class StylePromptGenerator(nn.Module):
             attention_mask=attention_mask,
             max_new_tokens=self.max_new_tokens,
             do_sample=False,
+            temperature=None,
+            top_p=None,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )

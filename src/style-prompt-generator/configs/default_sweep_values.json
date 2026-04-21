@@ -1,0 +1,23 @@
+{
+    "method": "bayes",
+    "metric": {
+        "name": "cv/mean_val_loss",
+        "goal": "minimize"
+    },
+    "parameters": {
+        "num_mapping_layers": {
+            "values": [
+                2,
+                4,
+                8
+            ]
+        },
+        "num_prefix_tokens": {
+            "values": [
+                5,
+                10,
+                20
+            ]
+        }
+    }
+}

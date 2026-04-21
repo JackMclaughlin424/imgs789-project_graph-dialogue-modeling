@@ -1,6 +1,10 @@
 import nltk
 from nltk.translate.meteor_score import meteor_score as _meteor
 from bert_score import score as _bert_score
+from sacrebleu.metrics import CHRF as _CHRF
+from rouge_score import rouge_scorer as _rouge_scorer
+
+
 import argparse
 import json
 import logging
@@ -8,6 +12,7 @@ import math
 import os
 import random
 import time
+import gc
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,21 +24,19 @@ from torch.utils.data import DataLoader, random_split
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    AutoModel,
-    Wav2Vec2FeatureExtractor,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
 
-from ConvoStyleDataset import ConvoStyleDataset, collate_pad
-from DialogueEncoder import (
+from dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
+from model.DialogueEncoder import (
     DualModalityEmbedder,
     SCFA,
     DialoguePooler,
     SelfAttentivePooling,
     ModalityEncoder,
 )
-from StylePromptGenerator import (
+from model.StylePromptGenerator import (
     StylePromptHead,
     StylePromptGenerator,
     SCFAWithStyleHead,
@@ -48,7 +51,7 @@ DEFAULTS: Dict[str, Any] = {
     "h5_path":               None,        # required
     "meta_path":             None,        # required
     "output_dir":            "runs/exp",
-    "num_turns":             5,           # 0 means text-only (script-only mode, no audio)
+    "num_turns":             5,           # >=1; anchor (last turn) is always text-only
     "max_len_sec":           15,        # trim/pad audio to this duration
 
     # model dimensions
@@ -100,7 +103,7 @@ DEFAULTS: Dict[str, Any] = {
     "sample_rate":           16_000,
 
     # logging
-    "log_every_n_steps":     10,
+    "log_every_n_steps":     50,
     "run_name":              None,        # optional label shown in log lines
 
     # wandb -- all optional; set use_wandb=false to disable entirely
@@ -115,7 +118,7 @@ VALID = {
     "d_model":          {192, 384, 768},
     "dialogue_pooler":  {"attentive", "last"},
     "lr_schedule":      {"cosine", "linear", "constant"},
-    "num_turns":        set(range(0, 6)),   # 0-5 inclusive
+    "num_turns":        set(range(1, 6)),   # 1-5 inclusive
     "num_prefix_tokens": {10, 20, 40},
     "batch_size":       {4, 8, 16, 32},
 }
@@ -289,7 +292,7 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> SCFAWithStyle
     ).to(device)
 
     tokenizer_llm = AutoTokenizer.from_pretrained(cfg["llm_repo"])
-    llm = AutoModelForCausalLM.from_pretrained(cfg["llm_repo"], dtype=torch.bfloat16).to(device)
+    llm = AutoModelForCausalLM.from_pretrained(cfg["llm_repo"], torch_dtype=torch.bfloat16).to(device)
     if tokenizer_llm.pad_token is None:
         tokenizer_llm.pad_token = tokenizer_llm.eos_token
 
@@ -310,17 +313,14 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> SCFAWithStyle
 # Data
 
 def build_dataloaders(cfg: Dict[str, Any], log):
-    # num_turns == 0 means script-only (text only), represented as 1 turn with no audio
-    effective_turns = max(cfg["num_turns"], 1)
-
     train_ds, val_ds = ConvoStyleDataset.train_val_split(
         val_split=cfg["val_split"],
         seed=cfg["seed"],
         h5_path=cfg["h5_path"],
         meta_path=cfg["meta_path"],
-        meta_columns=["transcription", "text_description"], # text_description is GT style description
+        meta_columns=["transcription", "text_description"],
         sample_rate=cfg["sample_rate"],
-        num_turns=effective_turns,
+        num_turns=cfg["num_turns"],
         max_len_sec=cfg["max_len_sec"],
     )
 
@@ -386,11 +386,32 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, cfg, out_dir
     return path
 
 
-def prune_old_checkpoints(out_dir: Path, keep: int, log):
+def prune_old_checkpoints(out_dir: Path, keep: int, log, wandb_run=None):
     ckpts = sorted(out_dir.glob("ckpt_epoch*.pt"))
     for old in ckpts[:-keep]:
+        # parse epoch from filename to match against artifact metadata
+        epoch_from_name = None
+        try:
+            epoch_from_name = int(old.stem.split("_")[1].replace("epoch", ""))
+        except (IndexError, ValueError):
+            pass
+
         old.unlink()
         log.info(f"Removed old checkpoint: {old}")
+
+        if wandb_run is not None and epoch_from_name is not None:
+            try:
+                import wandb
+                api = wandb.Api()
+                artifact_name = f"{wandb_run.entity}/{wandb_run.project}/checkpoint-{wandb_run.id}"
+                for av in api.artifacts(type_name="model", name=artifact_name):
+                    if av.metadata.get("epoch") == epoch_from_name:
+                        av.delete(delete_aliases=True)
+                        log.info(f"Deleted W&B artifact version for epoch {epoch_from_name}: {av.version}")
+                        break
+            except Exception as e:
+                log.warning(f"Could not delete W&B artifact for epoch {epoch_from_name}: {e}")
+
 
 
 def load_checkpoint(path: str, log, model, optimizer=None, scheduler=None):
@@ -491,3 +512,298 @@ def compute_meteor(
         "meteor_mean": float(scores.mean()) if len(scores) else 0.0,
         "meteor_std":  float(scores.std())  if len(scores) else 0.0,
     }
+
+def compute_chrf(
+    preds: List[str],
+    refs: List[str],
+) -> Dict[str, float]:
+    """Compute CHrF++ mean and std over a batch of predictions."""
+    chrf = _CHRF(word_order=2)  # word_order=2 gives CHrF++
+    scores = np.array([
+        chrf.sentence_score(pred, [ref]).score / 100.0  # normalize to [0, 1]
+        for pred, ref in zip(preds, refs)
+    ])
+    return {
+        "chrf_mean": float(scores.mean()) if len(scores) else 0.0,
+        "chrf_std":  float(scores.std())  if len(scores) else 0.0,
+    }
+
+
+def compute_rouge(
+    preds: List[str],
+    refs: List[str],
+) -> Dict[str, float]:
+    """Compute ROUGE-L mean and std over a batch of predictions."""
+    scorer = _rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    scores = np.array([
+        scorer.score(ref, pred)["rougeL"].fmeasure
+        for pred, ref in zip(preds, refs)
+    ])
+    return {
+        "rougeL_mean": float(scores.mean()) if len(scores) else 0.0,
+        "rougeL_std":  float(scores.std())  if len(scores) else 0.0,
+    }
+
+
+
+# CUSTOM TAG-LEVEL F1 metric
+
+VOCAB_REF: Dict[str, Any] = {
+  "expresso": {
+    "accent": [
+      "american"
+    ],
+    "gender": [
+      "female",
+      "male"
+    ],
+    "intrinsic_tags": [
+    #   "american",  excluded since already in another category
+      "authoritative",
+      "booming",
+      "crisp",
+      "enunciated",
+      "flowing",
+      "loud",
+      "nasal",
+      "shrill",
+      "silky",
+      "singsong"
+    ],
+    "situational_tags": [
+        'angry',
+        'animated',
+        'awed',
+        'bored',
+        'calm',
+        'confused',
+        'desirous',
+        'disgusted',
+        'enunciated',
+        # 'fast',
+        'happy',
+        'laughing',
+        'loud',
+        'passive',
+        'saddened',
+        'sarcastic',
+        'scared',
+        'sleepy',
+        'sympathetic',
+        'whispered'
+        ],
+    "noise": [
+      "clean environment",
+      "noisy environment",
+      "environment balanced"
+    ],
+    "pitch": [
+      "high-pitched"
+    ],
+    "speaking_rate": [
+      "fast speed",
+      "measured speed",
+      "slow speed"
+    ]
+  },
+  "styletalk": {
+    "emotion": [
+      "cheerful tone",
+      "excited tone",
+      "friendly tone",
+      "hopeful tone",
+      "neutral tone",
+      "sad tone",
+      "unfriendly tone"
+    ],
+    "speaking_rate": [
+      "fast speed",
+      "normal speed",
+      "slow speed"
+    ],
+    "volume": [
+      "loud volume",
+      "normal volume",
+      "quiet volume"
+    ]
+  }
+}
+
+_PATTERN_CACHE: Dict[str, Any] = {}
+
+def _load_tag_categories(source: str) -> Dict[str, Any]:
+    """Returns {category: compiled_regex} for the given source, compiled once."""
+    if source not in _PATTERN_CACHE:
+        import re
+        _PATTERN_CACHE[source] = {
+            cat: re.compile(
+                r'\b(' + '|'.join(re.escape(t) for t in sorted(tags, key=len, reverse=True)) + r')\b',
+                re.IGNORECASE,
+            )
+            for cat, tags in VOCAB_REF.get(source, {}).items()
+        }
+    return _PATTERN_CACHE[source]
+
+
+
+def _tags_present(pattern, text: str) -> set:
+    return set(m.lower() for m in pattern.findall(text))
+
+def _f1_sets(pred: set, ref: set) -> float:
+    if not pred and not ref:
+        return 1.0
+    if not pred or not ref:
+        return 0.0
+    tp = len(pred & ref)
+    p = tp / len(pred)
+    r = tp / len(ref)
+    return 2 * p * r / (p + r) if (p + r) else 0.0
+
+
+def compute_tag_f1(
+    preds: List[str],
+    refs: List[str],
+    test_dataset_source: str,
+) -> Dict[str, float]:
+    """Per-category tag F1 using word-boundary substring matching against the vocab."""
+    categories = _load_tag_categories(test_dataset_source)
+
+    cat_scores: Dict[str, List[float]] = {cat: [] for cat in categories}
+    overall_scores: List[float] = []
+
+    for pred, ref in zip(preds, refs):
+        all_pred, all_ref = set(), set()
+        for cat, tags in categories.items():
+            pred_tags = _tags_present(tags, pred)
+            ref_tags  = _tags_present(tags, ref)
+            cat_scores[cat].append(_f1_sets(pred_tags, ref_tags))
+            all_pred |= pred_tags
+            all_ref  |= ref_tags
+        overall_scores.append(_f1_sets(all_pred, all_ref))
+
+    metrics: Dict[str, float] = {}
+    for cat, scores in cat_scores.items():
+        arr = np.array(scores)
+        metrics[f"tag_f1_{cat}_mean"] = float(arr.mean()) if len(arr) else 0.0
+        metrics[f"tag_f1_{cat}_std"]  = float(arr.std())  if len(arr) else 0.0
+
+    arr = np.array(overall_scores)
+    metrics["tag_f1_overall_mean"] = float(arr.mean()) if len(arr) else 0.0
+    metrics["tag_f1_overall_std"]  = float(arr.std())  if len(arr) else 0.0
+
+    return metrics
+
+
+
+def _flatten(d: dict) -> dict:
+    """Strip _mean suffix → bare name; keep _std keys as-is."""
+    return {(k[:-5] if k.endswith("_mean") else k): v for k, v in d.items()}
+
+
+
+def eval_test_by_source(
+    model,
+    cfg: dict,
+    test_chains_by_source: dict,   # dict[src, list[chain]] from make_fixed_test_split
+    device: torch.device,
+    log
+) -> dict:
+    """Evaluate model on each source's fixed test chains; returns per-source metrics."""
+    loader_kw = dict(collate_fn=collate_pad, num_workers=cfg["num_workers"], pin_memory=True)
+
+    source_metrics = {}
+
+    for src, src_chains in test_chains_by_source.items():
+        test_ds = ConvoStyleDataset.from_prebuilt_chains(
+            chains=src_chains,
+            h5_path=cfg["h5_path"],
+            meta_columns=["transcription", "text_description"],
+            sample_rate=cfg["sample_rate"],
+            max_len_sec=cfg["max_len_sec"],
+        )
+        test_loader = DataLoader(test_ds, batch_size=cfg["batch_size"], shuffle=False, **loader_kw)
+        all_preds, all_refs, all_texts, all_vecs = [], [], [], []
+
+
+        with torch.no_grad():
+            for batch in test_loader:
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    audio       = batch["audio"].to(device)
+                    lengths     = batch["lengths"].to(device)
+                    text_only   = batch["text_only"].to(device)
+                    texts       = batch["transcription"]
+                    speaker_ids = batch["speaker_id"]
+                    targets     = batch["text_description"]
+                    if cfg["num_turns"] == 0:
+                        audio     = torch.zeros_like(audio)
+                        text_only = torch.ones_like(text_only)
+                    ctx = model.scfa(audio, lengths, texts, speaker_ids, text_only)
+                    vec = model.pooler(ctx)
+                    del ctx
+                    all_vecs.append(vec.float().detach().cpu())  # collect before delete
+                    preds = model.style_generator.generate(vec)
+                    del vec
+                
+                all_preds.extend(preds)
+                all_refs.extend([chain[-1] for chain in targets])
+                all_texts.extend(texts)
+
+        # free GPU memory
+        del test_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # collapse diagnostics on pooled dialogue vectors
+        vecs = torch.cat(all_vecs, dim=0)               # (N, 4*d_model)
+        vec_std      = vecs.std(dim=0).mean().item()     # near 0 = collapsed
+        vec_norm_cv  = (vecs.norm(dim=-1).std() /
+                        vecs.norm(dim=-1).mean()).item()  # coeff of variation of norms
+
+        # pairwise cosine similarity — mean off-diagonal → 1.0 = fully collapsed
+        normed   = torch.nn.functional.normalize(vecs, dim=-1)
+        sim_mat  = normed @ normed.T
+        n        = sim_mat.shape[0]
+        off_diag = sim_mat[~torch.eye(n, dtype=torch.bool)].mean().item()
+
+        del all_vecs, vecs, normed, sim_mat
+
+        
+        bs   = compute_bertscore(all_preds, all_refs, device=str(device))
+        met  = compute_meteor(all_preds, all_refs)
+        chrf = compute_chrf(all_preds, all_refs)
+        rou  = compute_rouge(all_preds, all_refs)
+        tf1  = compute_tag_f1(all_preds, all_refs, src)
+
+        # automate logging of lots of metrics
+        source_metrics[src] = {
+            **_flatten(bs),
+            **_flatten(met),
+            **_flatten(chrf),
+            **_flatten(rou),
+            **_flatten(tf1),
+            "vec_std":         vec_std,
+            "vec_norm_cv":     vec_norm_cv,
+            "mean_cosine_sim": off_diag,
+        }
+
+
+
+        for i, (pred, ref, txt) in enumerate(zip(all_preds[:3], all_refs[:3], all_texts[:3])):
+            log.info(f"  [Test/{src} Sample {i+1}]")
+            log.info(f"    Dialogue : {txt}")
+            log.info(f"    Predicted: {pred}")
+            log.info(f"    Reference: {ref}")
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return source_metrics
+
+
+def assert_no_test_leakage(trainval_ids: set, test_conv_ids: set) -> None:
+    """Raise if any test conv_id leaked into the train/val pool."""
+    overlap = trainval_ids & test_conv_ids
+    assert not overlap, (
+        f"Data leakage: {len(overlap)} conv_id(s) appear in both train/val and test sets: "
+        f"{sorted(overlap)[:5]}{'...' if len(overlap) > 5 else ''}"
+    )

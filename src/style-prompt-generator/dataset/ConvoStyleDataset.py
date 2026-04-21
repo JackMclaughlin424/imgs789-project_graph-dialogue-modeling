@@ -13,6 +13,14 @@ _TEXT_ONLY_SOURCES = {"styletalk"}
 
 # styletalk always has exactly this many text-only turns at the front of a chain
 _STYLETALK_TEXT_ONLY_TURNS = 3
+_STYLETALK_FINAL_TURN_INDEX = 4
+
+
+# Define test set
+_TEST_SEED                = 999
+_TEST_NUM_TURNS           = 5
+_TEST_N_CHAINS_PER_SOURCE = 150  # 150 × n_sources ≈ 300 total chains held out
+
 
 
 class ConvoStyleDataset(Dataset):
@@ -57,8 +65,16 @@ class ConvoStyleDataset(Dataset):
         # index by relative_audio_path so prev_filename lookups are O(1)
         self._path_to_row = meta.set_index("relative_audio_path")
 
-        # anchor rows are the "last" turn in each chain we want to load
-        anchors = meta[meta["turn_index"] >= (num_turns - 1)].reset_index(drop=True)
+        # anchor rows are the "last" turn in each chain we want to load, and they must have audio
+        # styletalk always anchors at its final turn; other sources use the rolling window
+        styletalk_mask = meta["source"].str.lower() == "styletalk"
+        styletalk_anchors = meta[
+            styletalk_mask & (meta["turn_index"] == _STYLETALK_FINAL_TURN_INDEX) & (meta["hdf5_idx"] >= 0)
+        ]
+        other_anchors = meta[
+            ~styletalk_mask & (meta["turn_index"] >= (num_turns - 1)) & (meta["hdf5_idx"] >= 0)
+        ]
+        anchors = pd.concat([styletalk_anchors, other_anchors]).reset_index(drop=True)
 
         # resolve every anchor into a full chain, drop any with broken links
         if meta_columns is not None:
@@ -115,19 +131,14 @@ class ConvoStyleDataset(Dataset):
 
 
     def _validate_styletalk_chain(self, chain: list) -> Optional[list]:
-        # styletalk: first N turns must be text-only, the rest must have audio
-        for turn_pos, row in enumerate(chain):
+        # use turn_index (not chain position) since we anchor at the final turn
+        for row in chain:
             hdf5_idx = int(row["hdf5_idx"])
-            is_text_only_slot = turn_pos < _STYLETALK_TEXT_ONLY_TURNS
-
-            if is_text_only_slot and hdf5_idx != -1:
-                # we expect text-only here; a real audio file is unexpected but not fatal
-                pass
-            elif not is_text_only_slot and hdf5_idx == -1:
-                # audio turns must actually have audio
+            is_text_only_slot = int(row["turn_index"]) < _STYLETALK_TEXT_ONLY_TURNS
+            if not is_text_only_slot and hdf5_idx == -1:
                 return None
-
         return chain
+
 
     def _validate_expresso_chain(self, chain: list) -> Optional[list]:
         # expresso: no text-only rows allowed anywhere in the chain
@@ -232,6 +243,90 @@ class ConvoStyleDataset(Dataset):
         train_ds = cls(**kwargs, allowed_conv_ids=train_ids)
         val_ds   = cls(**kwargs, allowed_conv_ids=val_ids)
         return train_ds, val_ds
+    
+    
+    @classmethod
+    def make_fixed_test_split(
+        cls,
+        h5_path:      str,
+        meta_path:    str,
+        meta_columns: Optional[List[str]] = None,
+        max_len_sec:  Optional[float]     = None,
+        sample_rate:  int                 = 16_000,
+        num_turns:    int                 = _TEST_NUM_TURNS,
+    ) -> tuple:
+        """
+        Deterministically carves out test chains using _TEST_* constants.
+        The fixed pool is always built at _TEST_NUM_TURNS (5) so chain identity
+        is stable across sweep configs. The last `num_turns` turns of each chain
+        are sliced before returning, so callers always receive chains whose audio
+        turns are at the end (styletalk-safe for any num_turns <= _TEST_NUM_TURNS).
+
+        Returns:
+            chains_by_source  - dict[str, list[chain]] sliced to num_turns
+            test_conv_ids     - set of conv_ids to exclude from train/val
+        """
+        full_ds = cls(
+            h5_path=h5_path,
+            meta_path=meta_path,
+            meta_columns=meta_columns,
+            max_len_sec=max_len_sec,
+            sample_rate=sample_rate,
+            num_turns=_TEST_NUM_TURNS,  # always build the full 5-turn chains
+        )
+
+        chains_by_source: dict = {}
+        for chain in full_ds._chains:
+            src = str(chain[-1].get("source", "unknown")).lower()
+            chains_by_source.setdefault(src, []).append(chain)
+
+        rng   = np.random.default_rng(_TEST_SEED)
+        fixed: dict = {}
+        for src in sorted(chains_by_source):          # sorted - reproducible rng order
+            chains = chains_by_source[src]
+            idxs   = np.arange(len(chains))
+            rng.shuffle(idxs)
+            n = min(_TEST_N_CHAINS_PER_SOURCE, len(idxs))
+            # slice to last num_turns so audio turns are always present (styletalk-safe)
+            fixed[src] = [chains[i][-num_turns:] for i in idxs[:n]]
+
+        test_conv_ids = {
+            chain[0]["conv_id"]
+            for chains in fixed.values()
+            for chain in chains
+        }
+        return fixed, test_conv_ids
+
+
+    @classmethod
+    def from_prebuilt_chains(
+        cls,
+        chains:       list,
+        h5_path:      str,
+        meta_columns: Optional[List[str]] = None,
+        max_len_sec:  Optional[float]     = None,
+        sample_rate:  int                 = 16_000,
+    ) -> "ConvoStyleDataset":
+        """Construct a dataset from pre-built chains (used for the fixed test split)."""
+        ds           = cls.__new__(cls)
+        ds.h5_path   = Path(h5_path)
+        ds.sr        = int(sample_rate)
+        ds.max_len   = int(float(max_len_sec) * ds.sr) if max_len_sec else None
+        ds.num_turns = len(chains[0]) if chains else 0
+        ds.transform = None
+        ds._chains   = chains
+        ds._h5       = None
+
+        required = {"hdf5_idx", "relative_audio_path", "prev_filename", "turn_index"}
+        if meta_columns is not None:
+            ds._extra_cols = [c for c in meta_columns if c not in required]
+        elif chains:
+            ds._extra_cols = [c for c in chains[0][0].index if c not in required]
+        else:
+            ds._extra_cols = []
+
+        return ds
+
 
 
 

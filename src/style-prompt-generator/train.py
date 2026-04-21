@@ -14,7 +14,10 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from StylePromptGenerator import (
+
+import pandas as pd
+
+from model.StylePromptGenerator import (
     SCFAWithStyleHead
 )
 
@@ -29,7 +32,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module=r"torch\._inducto
 
 
 
-from train_helpers import *
+from model.train_helpers import *
 
 logging.getLogger().addHandler(logging.NullHandler())
 logging.getLogger().setLevel(logging.INFO)
@@ -65,10 +68,10 @@ def compute_loss(
     # anchor is always the last turn
     anchor_prompts = [chain[-1] for chain in targets]  # list[B]
 
-    # num_turns == 0: treat as text-only by zeroing audio
-    if cfg["num_turns"] == 0:
-        audio = torch.zeros_like(audio)
-        text_only = torch.ones_like(text_only)
+    # anchor (last turn) is always text-only: predicting style for audio not yet recorded
+    audio[:, -1, :] = 0
+    lengths[:, -1]  = 0
+    text_only[:, -1] = True
 
 
     #
@@ -165,42 +168,59 @@ def _grad_norm(model: nn.Module) -> float:
 
 def run_epoch(
     model, loader, optimizer, scheduler, 
-    device, cfg, epoch, global_step, wandb_run, is_train=True,
+    device, cfg, epoch, global_step, wandb_run, log_handler=log
+    , is_train=True, use_tqdm=True
 ) -> tuple[float, int]:
     model.train(is_train)
     total_loss = 0.0
     n_batches  = 0
     tag = "TRAIN" if is_train else "VAL"
+
+    n_total = len(loader)
  
     ctx = torch.enable_grad if is_train else torch.no_grad
- 
-    with ctx():
-        pbar = tqdm(loader, desc=f"{tag} epoch {epoch}", unit="batch", leave=True, dynamic_ncols=True)
+    epoch_start = time.time()
 
-        for batch in pbar:
+    with ctx():
+        iterable = tqdm(loader, desc=f"{tag} epoch {epoch}", unit="batch", leave=True, dynamic_ncols=True) if use_tqdm else loader
+
+        for batch in iterable:
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 loss = compute_loss(model, batch, device, cfg)
  
             if is_train:
                 optimizer.zero_grad()
-                loss.backward()
-                if cfg["grad_clip"]:
-                    nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad],
-                        cfg["grad_clip"],
-                    )
-                optimizer.step()
- 
+                if not torch.isnan(loss) and not torch.isinf(loss):
+                    loss.backward()
+                    if cfg["grad_clip"]:
+                        nn.utils.clip_grad_norm_(
+                            [p for p in model.parameters() if p.requires_grad],
+                            cfg["grad_clip"],
+                        )
+                    optimizer.step()
+                else:
+                    log_handler.warning(f"Skipping optimizer step due to NaN/Inf loss at step {global_step}")
                 scheduler.step()
                 global_step += 1
+
  
                 if global_step % cfg["log_every_n_steps"] == 0:
                     lr = scheduler.get_last_lr()[0]
                     grad_norm = _grad_norm(model)
                     run = f"[{cfg['run_name']}] " if cfg["run_name"] else ""
-                    log.info(
-                        f"{run}epoch {epoch}  step {global_step}  "
-                        f"loss {loss.item():.4f}  lr {lr:.2e}  grad_norm {grad_norm:.3f}"
+
+                    eta_str = ""
+                    if not use_tqdm:
+                        batches_done = n_batches + 1
+                        elapsed = time.time() - epoch_start
+                        secs_per_batch = elapsed / batches_done
+                        remaining = (n_total - batches_done) * secs_per_batch
+                        fmt = lambda s: f"{int(s)//60:02d}:{int(s)%60:02d}"
+                        eta_str = f"  {fmt(elapsed)}<{fmt(remaining)}"
+
+                    log_handler.info(
+                        f"{run}epoch {epoch} - batch {n_batches + 1}/{n_total} - step {global_step} | "
+                        f"loss {loss.item():.4f}  lr {lr:.2e}  grad_norm {grad_norm:.3f}{eta_str}"
                     )
                     # step-level metrics -- logged at every log_every_n_steps
                     wandb_log({
@@ -211,9 +231,11 @@ def run_epoch(
  
             total_loss += loss.item()
             n_batches  += 1
+
+            
  
     avg = total_loss / max(n_batches, 1)
-    log.info(f"{tag} epoch {epoch} avg loss: {avg:.4f}")
+    log_handler.info(f"{tag} epoch {epoch} avg loss: {avg:.4f}")
     return avg, global_step
 
 
@@ -225,19 +247,17 @@ class TqdmHandler(logging.StreamHandler):
 
 def train(cfg: Dict[str, Any], resume=True):
     set_seed(cfg["seed"])
- 
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
- 
+
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # save the resolved config for reproducibility
     with open(out_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)
- 
-    wandb_run = wandb_init(cfg, log)
 
+    wandb_run = wandb_init(cfg, log)
 
     console_handler = TqdmHandler()
     console_handler.setLevel(logging.INFO)
@@ -249,12 +269,36 @@ def train(cfg: Dict[str, Any], resume=True):
     file_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S"))
     logging.getLogger().addHandler(file_handler)
     log.info("File logging initialized.")
- 
-    train_loader, val_loader, dataset = build_dataloaders(cfg, log)
-    
+
+    test_chains_by_source, test_conv_ids = ConvoStyleDataset.make_fixed_test_split(
+        h5_path=cfg["h5_path"],
+        meta_path=cfg["meta_path"],
+        meta_columns=["transcription", "text_description", "source"],
+        sample_rate=cfg["sample_rate"],
+        max_len_sec=cfg["max_len_sec"],
+        num_turns=cfg["num_turns"],
+    )
+
+    meta         = pd.read_parquet(cfg["meta_path"], columns=["conv_id"])
+    trainval_ids = set(c for c in meta["conv_id"].unique() if c not in test_conv_ids)
+    assert_no_test_leakage(trainval_ids, test_conv_ids)
+
+    ds_kwargs = dict(
+        h5_path=cfg["h5_path"],
+        meta_path=cfg["meta_path"],
+        meta_columns=["transcription", "text_description", "source"],
+        sample_rate=cfg["sample_rate"],
+        num_turns=cfg["num_turns"],
+        max_len_sec=cfg["max_len_sec"],
+    )
+    loader_kw    = dict(collate_fn=collate_pad, num_workers=cfg["num_workers"], pin_memory=True)
+    g            = torch.Generator().manual_seed(cfg["seed"])
+    train_ds     = ConvoStyleDataset(**ds_kwargs, allowed_conv_ids=trainval_ids)
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, generator=g, **loader_kw)
+    log.info(f"Chains: {len(train_ds)} train  |  {sum(len(v) for v in test_chains_by_source.values())} test")
+
     model = build_model(cfg, device, log)
 
-    # compile model for faster training
     if cfg["compile"]:
         model.scfa.ctx_audio = torch.compile(model.scfa.ctx_audio)
         model.scfa.ctx_text  = torch.compile(model.scfa.ctx_text)
@@ -264,126 +308,71 @@ def train(cfg: Dict[str, Any], resume=True):
         # spk_audio/spk_text take string speaker_ids so skip for now
         model.style_generator.style_head = torch.compile(model.style_generator.style_head)
 
-
- 
     total_steps = len(train_loader) * cfg["num_epochs"]
     optimizer, scheduler = build_optimizer_and_scheduler(model, cfg, total_steps, log)
- 
-    # W&B can watch gradients and parameter histograms if you want them
-    # log_freq controls how often histograms are computed -- expensive so keep it low
+
     if wandb_run is not None:
         import wandb
         wandb_run.watch(model, log="gradients", log_freq=cfg["log_every_n_steps"] * 5)
 
     start_epoch = 0
     global_step = 0
- 
-    # resume if a checkpoint exists in the output dir
+
     existing = sorted(out_dir.glob("ckpt_epoch*.pt"))
     if resume and existing:
         start_epoch, global_step = load_checkpoint(
             str(existing[-1]), log, model, optimizer, scheduler
         )
-        start_epoch += 1  # resume from the next epoch
- 
-    best_val_loss = float("inf")
-    patience_counter = 0
+        start_epoch += 1
 
- 
     for epoch in tqdm(
-        range(start_epoch, cfg["num_epochs"]), desc="Epochs"
-        , unit="epoch", initial=start_epoch, total=cfg["num_epochs"]
+        range(start_epoch, cfg["num_epochs"]), desc="Epochs",
+        unit="epoch", initial=start_epoch, total=cfg["num_epochs"]
     ):
         train_loss, global_step = run_epoch(
-            model, train_loader, optimizer, scheduler, 
+            model, train_loader, optimizer, scheduler,
             device, cfg, epoch, global_step, wandb_run, is_train=True,
         )
- 
-        # epoch-level train loss (separate key from step-level so the chart is clean)
-        epoch_metrics = {"epoch/train_loss": train_loss, "epoch": epoch}
-
-        if (epoch + 1) % cfg["eval_every_n_epochs"] == 0:
-            val_loss, _ = run_epoch(
-                model, val_loader, optimizer, scheduler, 
-                device, cfg, epoch, global_step, wandb_run, is_train=False,
-            )
-            epoch_metrics["epoch/val_loss"] = val_loss
-
-            min_delta = cfg["early_stopping_min_delta"]
-            if val_loss < best_val_loss - min_delta:
-                best_val_loss = val_loss
-                patience_counter = 0
-                epoch_metrics["epoch/best_val_loss"] = best_val_loss
-            elif cfg["early_stopping_patience"] > 0:
-                patience_counter += 1
-                log.info(f"No improvement for {patience_counter}/{cfg['early_stopping_patience']} epochs.")
-                if patience_counter >= cfg["early_stopping_patience"]:
-                    log.info("Early stopping triggered.")
-                    wandb_log(epoch_metrics, step=global_step, run=wandb_run)
-                    break
-
-
-
-
-        wandb_log(epoch_metrics, step=global_step, run=wandb_run)
+        wandb_log({"epoch/train_loss": train_loss, "epoch": epoch}, step=global_step, run=wandb_run)
 
         if (epoch + 1) % cfg["save_every_n_epochs"] == 0:
             ckpt_path = save_checkpoint(
                 model, optimizer, scheduler, epoch, global_step, train_loss, cfg, out_dir, log
             )
             log.info(f"Keeping last {cfg['keep_last_n_ckpts']} checkpoints, pruning older ones.")
-            prune_old_checkpoints(out_dir, cfg["keep_last_n_ckpts"], log)
- 
-            # log the checkpoint as a W&B artifact so you can restore any saved version
+            prune_old_checkpoints(out_dir, cfg["keep_last_n_ckpts"], log, wandb_run=wandb_run)
+
             if wandb_run is not None:
                 import wandb
                 artifact = wandb.Artifact(
                     name=f"checkpoint-{wandb_run.id}",
                     type="model",
-                    metadata={"epoch": epoch, "step": global_step, "val_loss": best_val_loss if best_val_loss != float("inf") else None},
-
+                    metadata={"epoch": epoch, "step": global_step},
                 )
                 artifact.add_file(str(ckpt_path))
                 wandb_run.log_artifact(artifact)
- 
-        log.info("Training complete.")
 
-    # compute text-quality metrics once on the final model state 
+    log.info("Training complete.")
+
+    log.info("Evaluating generation...")
     model.eval()
-    all_preds, all_refs = [], []
-    with torch.no_grad():
-        for batch in val_loader:
-            audio       = batch["audio"].to(device)
-            lengths     = batch["lengths"].to(device)
-            text_only   = batch["text_only"].to(device)
-            texts       = batch["transcription"]
-            speaker_ids = batch["speaker_id"]
-            targets     = batch["text_description"]
+    test_metrics = eval_test_by_source(model, cfg, test_chains_by_source, device, log)
 
-            if cfg["num_turns"] == 0:
-                audio     = torch.zeros_like(audio)
-                text_only = torch.ones_like(text_only)
+    for src, src_m in test_metrics.items():
+        log.info(
+            f"Test/{src}  bertscore_f1={src_m['bertscore_f1']:.4f}  "
+            f"meteor={src_m['meteor']:.4f}  chrf={src_m['chrf']:.4f}  "
+            f"tag_f1={src_m['tag_f1_overall']:.4f}"
+        )
+        wandb_log({f"test/{src}/{k}": v for k, v in src_m.items()}, step=global_step, run=wandb_run)
 
-            dialogue_ctx = model.scfa(audio, lengths, texts, speaker_ids, text_only)
-            dialogue_vec = model.pooler(dialogue_ctx)
-            preds = model.style_generator.generate(dialogue_vec)
-
-            all_preds.extend(preds)
-            all_refs.extend([chain[-1] for chain in targets])
-
-    bs_metrics  = compute_bertscore(all_preds, all_refs, device=str(device))
-    met_metrics = compute_meteor(all_preds, all_refs)
-    log.info(
-        f"Final val metrics — BERTScore F1: {bs_metrics['bertscore_f1_mean']:.4f} "
-        f"(±{bs_metrics['bertscore_f1_std']:.4f})  "
-        f"METEOR: {met_metrics['meteor_mean']:.4f} "
-        f"(±{met_metrics['meteor_std']:.4f})"
-    )
-    wandb_log({
-        f"final/{k}": v for k, v in {**bs_metrics, **met_metrics}.items()
-    }, step=global_step, run=wandb_run)
+    del train_loader
+    del model, optimizer, scheduler
+    gc.collect()
+    torch.cuda.empty_cache()
 
     wandb_finish(wandb_run)
+
 
 
 
@@ -400,9 +389,6 @@ def parse_args():
 
     p.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints and train from scratch")
     return p.parse_args()
-
-
-
 
 
 if __name__ == "__main__":

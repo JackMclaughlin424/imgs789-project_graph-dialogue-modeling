@@ -1,0 +1,23 @@
+{
+    "method": "grid",
+    "metric": {
+        "name": "meteor_mean",
+        "goal": "maximize"
+    },
+    "parameters": {
+        "data_source": {
+            "values": [
+                "both",
+                "styletalk",
+                "expresso"
+            ]
+        },
+        "num_few_shot": {
+            "values": [
+                10,
+                25,
+                50
+            ]
+        }
+    }
+}

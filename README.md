@@ -32,9 +32,6 @@ A final embedding will be produced from this graph, then this will be passed thr
 
 **Dataset**
 
-English Conversation Corpus
-- Pretraining style encoders: https://github.com/thuhcsi/english-conversation-corpus
-
 Expresso+ParaSpeechCaps
 - Expresso contains 23 hours of conversational speech data, ParaSpeechCaps provides rich style annotations for these conversations (1-2 detailed style descriptions per utterance)
 

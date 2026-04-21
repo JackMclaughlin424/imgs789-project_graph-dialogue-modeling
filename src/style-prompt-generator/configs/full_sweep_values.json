@@ -1,0 +1,45 @@
+{
+    "method": "bayes",
+    "metric": {
+        "name": "cv/mean_val_loss",
+        "goal": "minimize"
+    },
+    "parameters": {
+        "learning_rate": {
+            "distribution": "log_uniform_values",
+            "min": 1e-5,
+            "max": 1e-3
+        },
+        "weight_decay": {
+            "distribution": "log_uniform_values",
+            "min": 1e-4,
+            "max": 1e-2
+        },
+        "warmup_ratio": {
+            "distribution": "uniform",
+            "min": 0.0,
+            "max": 0.2
+        },
+        "dropout": {
+            "values": [
+                0.1,
+                0.2,
+                0.3
+            ]
+        },
+        "grad_clip": {
+            "values": [
+                0.5,
+                1.0,
+                2.0
+            ]
+        },
+        "lr_schedule": {
+            "values": [
+                "cosine",
+                "linear",
+                "constant"
+            ]
+        }
+    }
+}
