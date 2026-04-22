@@ -167,3 +167,93 @@ class _UtteranceFeatureExtractor(nn.Module):
         return torch.cat([text_emb, audio_emb], dim=-1)  # (B, T, 2*d_feat)
 
 
+
+# DialogueGCN
+
+class _DialogueGCNLayer(nn.Module):
+    """
+    Single relation-aware GCN layer with 5 relation types.
+
+    Relation taxonomy follows the complete directed graph construction in the paper:
+    each utterance pair gets an intra- or inter-speaker edge in each temporal direction,
+    and every node has a self-loop (the paper marks self-loops as future->past).
+
+    Update rule (per relation r, then summed):
+        h_v^new += W_r * mean_{u: u->v in r}(h_u)
+    Final: h_v^new = ReLU(sum_r contribution_r); LayerNorm(h_new + h)
+    """
+
+    _SELF         = 0
+    _INTRA_P2F    = 1   # same speaker, earlier turn -> later turn
+    _INTRA_F2P    = 2   # same speaker, later turn -> earlier turn
+    _INTER_P2F    = 3   # different speaker, earlier turn -> later turn
+    _INTER_F2P    = 4   # different speaker, later turn -> earlier turn
+    NUM_RELATIONS = 5
+
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        # independent linear map per relation type; no bias follows standard R-GCN
+        self.weights = nn.ModuleList(
+            [nn.Linear(d_model, d_model, bias=False) for _ in range(self.NUM_RELATIONS)]
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def build_adjacency(
+        speaker_ids: List[List[str]], N: int, device: torch.device
+    ) -> torch.Tensor:
+        """
+        Builds (B, NUM_RELATIONS, N, N) binary adjacency matrices.
+        adj[b, r, v, u] = 1 means node u sends a message to node v under relation r.
+        """
+        B   = len(speaker_ids)
+        R   = _DialogueGCNLayer.NUM_RELATIONS
+        adj = torch.zeros(B, R, N, N, device=device)
+        for b in range(B):
+            spk = speaker_ids[b]
+            for v in range(N):
+                adj[b, _DialogueGCNLayer._SELF, v, v] = 1.0
+                for u in range(N):
+                    if u == v:
+                        continue
+                    same = spk[u] == spk[v]
+                    if u < v:
+                        # u is temporally before v: edge u->v is past-to-future
+                        r = _DialogueGCNLayer._INTRA_P2F if same else _DialogueGCNLayer._INTER_P2F
+                    else:
+                        # u is temporally after v: edge u->v is future-to-past
+                        r = _DialogueGCNLayer._INTRA_F2P if same else _DialogueGCNLayer._INTER_F2P
+                    adj[b, r, v, u] = 1.0
+        return adj
+
+    def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # h:   (B, N, d_model)
+        # adj: (B, NUM_RELATIONS, N, N)
+        agg = torch.zeros_like(h)
+        for r in range(self.NUM_RELATIONS):
+            A   = adj[:, r, :, :]                          # (B, N, N)
+            # mean-normalise by in-degree so nodes with many neighbours don't dominate
+            deg = A.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            msg = (A / deg) @ h                             # (B, N, d_model)
+            agg = agg + self.weights[r](msg)
+        out = self.drop(F.relu(agg))
+        return self.norm(out + h)                           # residual + LN
+
+
+class _DialogueGCN(nn.Module):
+    # Stack of relation-aware GCN layers; the paper uses 1 iteration.
+
+    def __init__(self, d_model: int, num_layers: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_DialogueGCNLayer(d_model, dropout) for _ in range(num_layers)]
+        )
+
+    def forward(self, h: torch.Tensor, speaker_ids: List[List[str]]) -> torch.Tensor:
+        # h: (B, N, d_model)
+        _, N, _ = h.shape
+        adj = _DialogueGCNLayer.build_adjacency(speaker_ids, N, h.device)
+        for layer in self.layers:
+            h = layer(h, adj)
+        return h  # (B, N, d_model)
