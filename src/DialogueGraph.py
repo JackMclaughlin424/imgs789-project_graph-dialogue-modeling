@@ -257,3 +257,125 @@ class _DialogueGCN(nn.Module):
         for layer in self.layers:
             h = layer(h, adj)
         return h  # (B, N, d_model)
+
+
+# Context attention pooling
+
+class _ContextAttentionPooling(nn.Module):
+    # Bahdanau-style additive attention where the current (anchor) turn is the
+    # query and each context node's [GCN-output; original-embedding] pair is the KV.
+    # Returns both the context vector and the attention weights for inspection.
+
+    def __init__(self, query_dim: int, kv_dim: int, attn_dim: int):
+        super().__init__()
+        self.q_proj = nn.Linear(query_dim, attn_dim, bias=False)
+        self.k_proj = nn.Linear(kv_dim,    attn_dim, bias=False)
+        self.score  = nn.Linear(attn_dim,  1,        bias=False)
+
+    def forward(
+        self,
+        query: torch.Tensor,                   # (B, query_dim)
+        kv:    torch.Tensor,                   # (B, N, kv_dim)
+        mask:  Optional[torch.Tensor] = None,  # (B, N) bool, True = valid
+    ):
+        q      = self.q_proj(query).unsqueeze(1)            # (B, 1, attn_dim)
+        k      = self.k_proj(kv)                            # (B, N, attn_dim)
+        scores = self.score(torch.tanh(q + k)).squeeze(-1)  # (B, N)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.bool(), float("-inf"))
+        weights = F.softmax(scores, dim=-1)                 # (B, N)
+        context = (weights.unsqueeze(-1) * kv).sum(dim=1)  # (B, kv_dim)
+        return context, weights
+
+
+# Top-level module
+
+class DialogueGraph(nn.Module):
+    """
+    Full DialogueGraph pipeline (Figure 2).
+
+    Constructor args
+    ----------------
+    bert_model, wavlm_model, tokenizer, processor, sample_rate
+        Pre-loaded HuggingFace model and processor objects; frozen during
+        feature extraction (no_grad used inside _UtteranceFeatureExtractor).
+    d_feat : int
+        Projection dimension for each modality (text and audio) after pooling.
+        The extractor concatenates both, so node hidden size entering the GCN
+        is 2 * d_feat after input_proj maps it to d_model.
+    d_model : int
+        Internal dimension for the GCN and attention layers.
+    d_out : int
+        Dimension of the returned style vector.
+    attn_dim : int
+        Hidden dimension inside the Bahdanau scoring MLP.
+    num_gcn_layers : int
+        Number of stacked _DialogueGCNLayer passes (paper uses 1).
+    dropout : float
+        Dropout applied inside each GCN layer.
+    """
+
+    def __init__(
+        self,
+        bert_model,
+        wavlm_model,
+        tokenizer,
+        processor,
+        sample_rate:    int,
+        d_feat:         int,
+        d_model:        int,
+        d_out:          int,
+        attn_dim:       int,
+        num_gcn_layers: int   = 1,
+        dropout:        float = 0.1,
+    ):
+        super().__init__()
+        self.extractor    = _UtteranceFeatureExtractor(
+            bert_model, wavlm_model, tokenizer, processor, sample_rate, d_feat
+        )
+        # project concatenated (text || audio) features to GCN working dimension
+        self.input_proj   = nn.Linear(2 * d_feat, d_model)
+        self.gcn          = _DialogueGCN(d_model, num_gcn_layers, dropout)
+        # KV fed to attention is [g_i; h_i], so kv_dim = 2 * d_model
+        self.context_attn = _ContextAttentionPooling(d_model, 2 * d_model, attn_dim)
+        # final cat is [current_h; context_vec] -> d_model + 2*d_model
+        self.out_proj     = nn.Linear(3 * d_model, d_out)
+
+    def forward(
+        self,
+        audio:        torch.Tensor,                    # (B, T, samples)
+        lengths:      torch.Tensor,                    # (B, T) raw sample counts
+        texts:        List[List[str]],                 # [B][T]
+        speaker_ids:  List[List[str]],                 # [B][T], last entry is anchor
+        text_only:    Optional[torch.Tensor] = None,   # (B, T) bool
+        context_mask: Optional[torch.Tensor] = None,   # (B, T-1) bool, True = real turn
+    ) -> torch.Tensor:
+        # --- feature extraction ---
+        feats = self.extractor(audio, lengths, texts, text_only)  # (B, T, 2*d_feat)
+        h     = self.input_proj(feats)                            # (B, T, d_model)
+
+        # last turn is the anchor; all prior turns form the context graph
+        context_h = h[:, :-1, :]   # (B, N, d_model),  N = T - 1
+        current_h = h[:, -1,  :]   # (B, d_model)
+
+        if context_h.shape[1] == 0:
+            # degenerate case: no context, return projection of current turn only
+            zeros = torch.zeros(
+                current_h.shape[0], 2 * self.context_attn.k_proj.in_features,
+                device=current_h.device, dtype=current_h.dtype,
+            )
+            return self.out_proj(torch.cat([current_h, zeros], dim=-1))
+
+        # --- DialogueGCN over context nodes ---
+        context_speaker_ids = [s[:-1] for s in speaker_ids]  # drop anchor from each item
+        g = self.gcn(context_h, context_speaker_ids)          # (B, N, d_model)
+
+        # form key-value pairs as described in paper: concatenate GCN output with
+        # the original pre-GCN embedding so the attention can use both representations
+        kv = torch.cat([g, context_h], dim=-1)  # (B, N, 2*d_model)
+
+        # --- attention pooling ---
+        context_vec, _ = self.context_attn(current_h, kv, context_mask)  # (B, 2*d_model)
+
+        # --- final projection ---
+        return self.out_proj(torch.cat([current_h, context_vec], dim=-1))  # (B, d_out)
