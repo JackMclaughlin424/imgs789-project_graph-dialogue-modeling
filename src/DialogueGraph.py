@@ -95,7 +95,11 @@ class _UtteranceFeatureExtractor(nn.Module):
         self.audio_proj = nn.Linear(768, d_feat)
 
     def _encode_text_flat(self, flat_texts: List[str]) -> torch.Tensor:
-        device = next(self.bert.parameters()).device
+        device = next(iter(self.bert.parameters()), None)
+        if device is None:
+            raise RuntimeError("bert_model has no parameters — was it initialized correctly?")
+        device = device.device
+
         tokens = self.tokenizer(
             flat_texts, return_tensors="pt", padding=True,
             truncation=True, max_length=512,
