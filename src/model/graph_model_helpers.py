@@ -1,18 +1,27 @@
 
 
+from tqdm import tqdm
+
 from capstone_src.style_prompt_generator.model.train_helpers import (
     _flatten,
     compute_bertscore, compute_meteor, compute_chrf
     , compute_rouge, compute_tag_f1, compute_dist, compute_pred_semantic_sim
+    , wandb_finish, wandb_init, wandb_log
 )
+
+from capstone_src.style_prompt_generator.train import _grad_norm
 
 from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import (
     ConvoStyleDataset, collate_pad
 )
 
 from model.DialogueGraph import DialogueGraph
+from model.GraphStylePromptGenerator import build_style_generator, GraphStylePrompt
+
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from typing import Dict, Any
@@ -42,50 +51,151 @@ def build_audio_encoder(cfg: Dict[str, Any], device: torch.device, log):
     return model, processor
 
 
-def build_model(cfg: Dict[str, Any], device: torch.device, log) -> DialogueGraph:
+def build_model(cfg: Dict[str, Any], device: torch.device, log) -> GraphStylePrompt:
     log.info("Building model...")
 
     text_backbone, tokenizer = build_text_encoder(cfg, device, log)
     audio_backbone, processor = build_audio_encoder(cfg, device, log)
 
-    dialogue_graph = DialogueGraph()    # fill in
-
-
-    # LLM embedding dim is fixed at LLM_DIM
-    head = StylePromptHead(
+    dialogue_graph = DialogueGraph(
+        bert_model=text_backbone,
+        wavlm_model=audio_backbone,
+        tokenizer=tokenizer,
+        processor=processor,
+        sample_rate=cfg["sample_rate"],
+        d_feat=cfg["d_feat"],
         d_model=cfg["d_model"],
+        d_out=cfg["d_out"],
+        attn_dim=cfg["attn_dim"],
+        num_gcn_layers=cfg.get("num_gcn_layers", 1),
+        dropout=cfg.get("dropout", 0.1),
+    ).to(device)
+
+    model = build_style_generator(
+        dialogue_graph=dialogue_graph,
+        d_out=cfg["d_out"],
         num_prefix_tokens=cfg["num_prefix_tokens"],
-        llm_dim=cfg["llm_dim"],
         num_mapping_layers=cfg["num_mapping_layers"],
         nhead=cfg["mapping_nhead"],
-        dropout=cfg["dropout"],
-    ).to(device)
-
-    tokenizer_llm = AutoTokenizer.from_pretrained(cfg["llm_repo"])
-    llm = AutoModelForCausalLM.from_pretrained(cfg["llm_repo"], torch_dtype=torch.bfloat16).to(device)
-    if tokenizer_llm.pad_token is None:
-        tokenizer_llm.pad_token = tokenizer_llm.eos_token
-
-
-    generator = StylePromptGenerator(
-        style_head=head,
-        tokenizer=tokenizer_llm,
-        llm=llm,
-        system_prompt=cfg["system_prompt"],
         max_new_tokens=cfg["max_new_tokens"],
         max_prompt_tokens=cfg["max_prompt_tokens"],
-    ).to(device)
-
-    model = SCFAWithStyleHead(scfa=scfa, pooler=pooler, style_generator=generator)
+        system_prompt=cfg["system_prompt"],
+        device=device,
+        torch_dtype=torch.bfloat16,
+    )
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Trainable parameters: {trainable_params:,}")
 
     return model
 
+
+def compute_loss(
+    model: GraphStylePrompt,
+    batch: Dict[str, Any],
+    device: torch.device,
+    cfg: Dict[str, Any],
+    log
+) -> torch.Tensor:
+    """
+    Teacher-forced cross-entropy over the style prompt tokens.
+
+    The LLM is frozen, so we only flow gradients through the mapping network
+    (StylePromptHead), SCFA model, and optionally the unfrozen layers of BERT and WavLM.
+    """
+    audio      = batch["audio"].to(device)        # (B, T, samples)
+    lengths    = batch["lengths"].to(device)      # (B, T)
+    text_only  = batch["text_only"].to(device)    # (B, T)
+    texts      = batch["transcription"]           # list[B][T]
+    speaker_ids = batch["speaker_id"]             # list[B][T]
+    targets    = batch["text_description"]            # list[B][T] -- we want the anchor turn's prompt
+
+    # anchor is always the last turn
+    anchor_prompts = [chain[-1] for chain in targets]  # list[B]
+
+    # anchor (last turn) is always text-only: predicting style for audio not yet recorded
+    audio[:, -1, :] = 0
+    lengths[:, -1]  = 0
+    text_only[:, -1] = True
+
+
+    #
+    #   RUNNING MODEL
+    #
+
+    dialogue_vec = model.dialogue_graph(audio, lengths, texts, speaker_ids, text_only)
+    prefix_embeds = model.style_generator.style_head(dialogue_vec)  # (B, K, TINYLLAMA_DIM)
+
+    if torch.isnan(prefix_embeds).any():
+        log.warning(f"NaN in prefix_embeds! dialogue_vec nan={torch.isnan(dialogue_vec).any()}")
+        return torch.tensor(float('nan'), device=device, requires_grad=True)
+
+    B = prefix_embeds.shape[0]
+    K = prefix_embeds.shape[1]
+
+    # tokenize the target style descriptions
+    tokenizer = model.style_generator.tokenizer
+    llm       = model.style_generator.llm
+
+    target_tokens = tokenizer(
+        anchor_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=cfg["max_style_desc_tokens"],
+    )
+    input_ids = target_tokens.input_ids.to(device)   # (B, L)
+    attn_mask = target_tokens.attention_mask.to(device)
+
+    # embed target tokens for teacher forcing
+    token_embeds = llm.get_input_embeddings()(input_ids)  # (B, L, TINYLLAMA_DIM)
+
+    # optionally prepend system prompt, skip if empty string
+    if model.style_generator.system_prompt:
+        prompt_tokens = tokenizer(
+            [model.style_generator.system_prompt] * B,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=cfg["max_style_desc_tokens"],
+        )
+        prompt_embeds = llm.get_input_embeddings()(prompt_tokens.input_ids.to(device))
+
+        input_embeds = torch.cat([prefix_embeds, prompt_embeds, token_embeds], dim=1)
+        prefix_mask  = torch.ones(B, K + prompt_embeds.shape[1], dtype=torch.long, device=device)
+        full_mask    = torch.cat([prefix_mask, attn_mask], dim=1)
+    else:
+        input_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+        prefix_mask  = torch.ones(B, K, dtype=torch.long, device=device)
+        full_mask    = torch.cat([prefix_mask, attn_mask], dim=1)
+
+    # build labels: -100 for prefix positions (not supervised), token ids elsewhere
+    prefix_labels = torch.full((B, input_embeds.shape[1] - input_ids.shape[1]), -100, device=device)
+    token_labels  = input_ids.masked_fill(attn_mask == 0, -100)
+    labels        = torch.cat([prefix_labels, token_labels], dim=1)
+
+    valid_label_count = (labels != -100).sum()
+    if valid_label_count == 0:
+        log.warning(f"All labels are -100! anchor_prompts sample: {anchor_prompts[0]!r}")
+
+    # cast input embeddings to TinyLlama dtype bf16
+    input_embeds = input_embeds.to(llm.dtype)
+
+    if torch.isnan(input_embeds).any() or torch.isinf(input_embeds).any():
+        log.warning(f"NaN/Inf in input_embeds after dtype cast. Max abs: {input_embeds.abs().max().item():.2e}")
+
+    outputs = llm(
+        inputs_embeds=input_embeds,
+        attention_mask=full_mask,
+        labels=labels,
+    )
+
+    return outputs.loss
+
+
 def run_epoch(
     model, loader, optimizer, scheduler, 
-    device, cfg, epoch, global_step, wandb_run, log_handler=log
+    device, cfg, epoch, global_step, wandb_run, log_handler
     , is_train=True, use_tqdm=True
 ) -> tuple[float, int]:
     model.train(is_train)
@@ -103,7 +213,7 @@ def run_epoch(
 
         for batch in iterable:
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = compute_loss(model, batch, device, cfg)
+                loss = compute_loss(model, batch, device, cfg, log=log_handler)
  
             if is_train:
                 optimizer.zero_grad()
@@ -192,11 +302,11 @@ def eval_test_by_source(
                 if cfg["num_turns"] == 0:
                     _audio     = torch.zeros_like(_audio)
                     _text_only = torch.ones_like(_text_only)
-                _ctx = model.scfa(_audio, _lengths, _texts, _speaker_ids, _text_only)
-                _vec = model.pooler(_ctx)
+                
+                _ctx = model.dialogue_graph(_audio, _lengths, _texts, _speaker_ids, _text_only)
+                model.style_generator.generate(_ctx)
                 del _ctx
-                model.style_generator.generate(_vec)
-                del _vec
+
         if device.type == "cuda":
             torch.cuda.synchronize()
 
@@ -213,12 +323,13 @@ def eval_test_by_source(
                     if cfg["num_turns"] == 0:
                         audio     = torch.zeros_like(audio)
                         text_only = torch.ones_like(text_only)
-                    ctx = model.scfa(audio, lengths, texts, speaker_ids, text_only)
-                    vec = model.pooler(ctx)
-                    del ctx
+                    
+                    vec = model.dialogue_graph(audio, lengths, texts, speaker_ids, text_only)
                     all_vecs.append(vec.float().detach().cpu())
+                    
                     preds = model.style_generator.generate(vec)
                     del vec
+
                 
                 all_preds.extend(preds)
                 all_refs.extend([chain[-1] for chain in targets])
