@@ -157,7 +157,8 @@ class _UtteranceFeatureExtractor(nn.Module):
         text_flat  = self._encode_text_flat(flat_texts)              # (B*T, 768)
         text_emb   = self.text_proj(text_flat).view(B, T, d_feat)   # (B, T, d_feat)
 
-        audio_emb = torch.zeros(B, T, d_feat, dtype=audio.dtype, device=device)
+        audio_emb = torch.zeros(B, T, d_feat, dtype=torch.bfloat16, device=device)
+
         for t in range(T):
             if text_only is not None and text_only[:, t].all():
                 continue
