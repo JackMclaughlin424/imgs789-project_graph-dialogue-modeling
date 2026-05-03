@@ -38,9 +38,116 @@ Expresso+ParaSpeechCaps
 StyleTalk
 - 7 hours of synthetic conversational speech with style annotations. "Easier" than Expresso+ParaSpeechCaps
 
-**Model**
 
-**Experiments**
+
+## DialogueGraph - Component Summary
+
+**Overview**
+- Models a conversation as a graph to extract a style vector for the current (anchor) utterance, conditioned on dialogue context
+- Final embedding used to tune a vector of prefix tokens, or a soft prompt, to condition an LLM to produce a style prompt. 
+- Input: a batch of T turns where the last turn is the anchor/current utterance
+- Output: `(B, d_out)` - one style vector per batch sample
+
+---
+
+### `_SelfAttentivePooling`
+- Collapses a variable-length sequence `(B, T, dim)` to a single vector `(B, dim)`
+- Learns a scalar score per time step via `Linear(dim, 1)`, softmaxes over T, then takes a weighted sum
+- Mask handling prevents NaN from softmax when an entire row is padding (e.g., a silent audio turn)
+
+---
+
+### `_UtteranceFeatureExtractor`
+Extracts a fixed-size feature vector for every turn in every batch item using both text and audio.
+
+**Text path:**
+- All `B*T` utterance strings are flattened into a single batch and passed through BERT, producing `last_hidden_state` of shape `(B*T, seq_len, 768)`
+- `_SelfAttentivePooling` collapses the token dimension, giving `(B*T, 768)`
+- A linear projection maps to `d_feat`, then the result is reshaped to `(B, T, d_feat)`
+
+**Audio path** (processed turn-by-turn, looping over T):
+- WavLM produces 13 hidden states (1 CNN embedding layer + 12 transformer layers), each of shape `(B, T_wav, 768)`
+- A learned per-layer scalar weight (softmaxed over 13 layers) computes a weighted sum, giving `(B, T_wav, 768)`
+- The raw-sample length mask is downsampled to match WavLM's subsampled frame length `T_wav`
+- `_SelfAttentivePooling` collapses the frame dimension to `(B, 768)`
+- A linear projection maps to `d_feat`, giving `(B, d_feat)` per turn
+- `wavlm_layer_weights` (shape 13) is the only trained parameter in the audio path; BERT and WavLM are both frozen
+
+**Final output:**
+- Text and audio embeddings are concatenated along the feature axis: `(B, T, 2*d_feat)`
+- **Differs from source paper**, because using WavLM rather than word-level style tokens and CBHG (Convolution bank + highway network + bidirectional GRU).
+
+---
+
+### `_DialogueGCNLayer` / `_DialogueGCN`
+Propagates information between context turns (graph nodes) according to speaker relationship and temporal direction.
+
+**Graph construction:**
+- For N context turns, builds a `(B, 5, N, N)` binary adjacency tensor - one matrix per relation type
+- Relation types: `SELF` (self-loop), `INTRA_P2F` (same speaker, earlier -> later), `INTRA_F2P` (same speaker, later -> earlier), `INTER_P2F` (different speaker, earlier -> later), `INTER_F2P` (different speaker, later -> earlier)
+- Every pair of nodes gets an edge under exactly one of the four non-self relation types (complete directed graph)
+
+**Update rule** (per layer, per relation r):
+- Slice adjacency for relation r: `(B, N, N)`
+- Mean-normalize by in-degree so high-degree nodes do not dominate
+- Aggregate neighbor features via matrix multiply: `(B, N, d_model)`
+- Apply a relation-specific linear transform `W_r` (no bias): `(B, N, d_model)`
+- Sum contributions across all 5 relations, apply ReLU and Dropout
+- Add residual connection and apply LayerNorm: `(B, N, d_model)`
+- The paper uses 1 GCN layer; the GCN only operates on the N = T-1 context turns, not the anchor
+
+---
+
+### `_ContextAttentionPooling`
+- The anchor (current turn) acts as the query; each context node's feature pair acts as the key/value
+- Key/value input is `[g_i; h_i]` - GCN output concatenated with the original pre-GCN embedding
+- Query projected to `attn_dim`: `(B, 1, attn_dim)`
+- Keys projected to `attn_dim`: `(B, N, attn_dim)`
+- Scores computed via `tanh(q + k)` -> `Linear(attn_dim, 1)`: `(B, N)`
+- Softmax (with optional padding mask) produces attention weights: `(B, N)`
+- Weighted sum over KV pairs produces the context vector: `(B, 2*d_model)`
+
+---
+
+### `DialogueGraph` (top-level)
+Full forward pass with example dimensions `d_feat=128, d_model=256, d_out=512, attn_dim=128`:
+
+| Step | Shape |
+|---|---|
+| Feature extractor output | `(B, T, 2*d_feat)` = `(B, T, 256)` |
+| `input_proj` `Linear(256, 256)` | `(B, T, 256)` |
+| Split -> `context_h`, `current_h` | `(B, N, 256)`, `(B, 256)` |
+| GCN output `g` | `(B, N, 256)` |
+| KV = `[g; context_h]` | `(B, N, 512)` |
+| Context vector | `(B, 512)` |
+| `cat([current_h, context_vec])` | `(B, 768)` |
+| `out_proj` `Linear(768, d_out)` | `(B, 512)` |
+
+---
+
+### Role in the Larger Model
+
+```
+Conversation (T turns of text + audio)
+        |
+  DialogueGraph
+        |
+   (B, d_out) style vector
+        |
+   downstream projection into LLaMA embedding space
+        |
+   Tuned soft prompt conditions LLaMa to produce style prompt
+```
+
+- The style vector encodes *how* the current utterance should sound based on who said what, in what order, and in what speaker relationship
+- The 5 separate relation weight matrices in the GCN let the model learn different propagation rules per edge type - a cross-speaker response (`INTER_P2F`) is treated differently from a same-speaker continuation (`INTRA_P2F`)
+- The style vector is "decoded" to natural language by turning it into a soft prompt and conditioning an LLM on it.
+
+
+## Experiments
+
+- Number of turns in dialogue
+- 
 
 ## Prior/Inspiring Work
 

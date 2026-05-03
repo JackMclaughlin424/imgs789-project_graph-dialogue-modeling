@@ -307,6 +307,10 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> SCFAWithStyle
     ).to(device)
 
     model = SCFAWithStyleHead(scfa=scfa, pooler=pooler, style_generator=generator)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"Trainable parameters: {trainable_params:,}")
+
     return model
 
 
@@ -347,7 +351,7 @@ def build_optimizer_and_scheduler(model: SCFAWithStyleHead, cfg: Dict[str, Any],
     # only optimize parameters that require gradients
     # (LLM is frozen inside StylePromptGenerator; backbone layers may be partially frozen)
     trainable = [p for p in model.parameters() if p.requires_grad]
-    log.info(f"Trainable parameters: {sum(p.numel() for p in trainable):,}")
+    # log.info(f"Trainable parameters: {sum(p.numel() for p in trainable):,}")
 
     optimizer = torch.optim.AdamW(
         trainable,
@@ -693,6 +697,30 @@ def compute_tag_f1(
 
     return metrics
 
+def compute_dist(preds: List[str]) -> Dict[str, float]:
+    """Dist-1 and Dist-2: proportion of unique unigrams/bigrams across all predictions."""
+    all_unigrams, all_bigrams = [], []
+    for pred in preds:
+        tokens = pred.lower().split()
+        all_unigrams.extend(tokens)
+        all_bigrams.extend(zip(tokens, tokens[1:]))
+    dist1 = len(set(all_unigrams)) / len(all_unigrams) if all_unigrams else 0.0
+    dist2 = len(set(all_bigrams))  / len(all_bigrams)  if all_bigrams  else 0.0
+    return {"dist1": dist1, "dist2": dist2}
+
+
+def compute_pred_semantic_sim(preds: List[str], device: str = "cpu") -> Dict[str, float]:
+    """Mean pairwise cosine similarity of sentence embeddings across all predictions.
+    Values near 1.0 indicate low diversity; near 0.0 indicates high diversity."""
+    from sentence_transformers import SentenceTransformer
+    embedder = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+    embs = embedder.encode(preds, convert_to_tensor=True, normalize_embeddings=True)
+    sim_mat = embs @ embs.T
+    n = sim_mat.shape[0]
+    off_diag = sim_mat[~torch.eye(n, dtype=torch.bool, device=sim_mat.device)].mean().item()
+    del embedder, embs, sim_mat
+    return {"pred_semantic_sim": off_diag}
+
 
 
 def _flatten(d: dict) -> dict:
@@ -724,7 +752,28 @@ def eval_test_by_source(
         test_loader = DataLoader(test_ds, batch_size=cfg["batch_size"], shuffle=False, **loader_kw)
         all_preds, all_refs, all_texts, all_vecs = [], [], [], []
 
+        # Warm-up: one forward pass to trigger CUDA kernel compilation and
+        # GPU memory allocation before the timed region begins.
+        warm_batch = next(iter(test_loader))
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                _audio       = warm_batch["audio"].to(device)
+                _lengths     = warm_batch["lengths"].to(device)
+                _text_only   = warm_batch["text_only"].to(device)
+                _texts       = warm_batch["transcription"]
+                _speaker_ids = warm_batch["speaker_id"]
+                if cfg["num_turns"] == 0:
+                    _audio     = torch.zeros_like(_audio)
+                    _text_only = torch.ones_like(_text_only)
+                _ctx = model.scfa(_audio, _lengths, _texts, _speaker_ids, _text_only)
+                _vec = model.pooler(_ctx)
+                del _ctx
+                model.style_generator.generate(_vec)
+                del _vec
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
+        t0_infer = time.time()
         with torch.no_grad():
             for batch in test_loader:
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -740,13 +789,15 @@ def eval_test_by_source(
                     ctx = model.scfa(audio, lengths, texts, speaker_ids, text_only)
                     vec = model.pooler(ctx)
                     del ctx
-                    all_vecs.append(vec.float().detach().cpu())  # collect before delete
+                    all_vecs.append(vec.float().detach().cpu())
                     preds = model.style_generator.generate(vec)
                     del vec
                 
                 all_preds.extend(preds)
                 all_refs.extend([chain[-1] for chain in targets])
                 all_texts.extend(texts)
+        inference_time = time.time() - t0_infer
+
 
         # free GPU memory
         del test_loader
@@ -773,6 +824,9 @@ def eval_test_by_source(
         chrf = compute_chrf(all_preds, all_refs)
         rou  = compute_rouge(all_preds, all_refs)
         tf1  = compute_tag_f1(all_preds, all_refs, src)
+        div  = compute_dist(all_preds)
+        psem = compute_pred_semantic_sim(all_preds, device=str(device))
+
 
         # automate logging of lots of metrics
         source_metrics[src] = {
@@ -781,10 +835,15 @@ def eval_test_by_source(
             **_flatten(chrf),
             **_flatten(rou),
             **_flatten(tf1),
-            "vec_std":         vec_std,
-            "vec_norm_cv":     vec_norm_cv,
-            "mean_cosine_sim": off_diag,
+            **div,
+            **psem,
+            "vec_std":           vec_std,
+            "vec_norm_cv":       vec_norm_cv,
+            "mean_cosine_sim":   off_diag,
+            "inference_time_s":  inference_time,
         }
+
+
 
 
 

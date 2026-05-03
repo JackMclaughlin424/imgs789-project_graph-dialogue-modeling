@@ -57,7 +57,8 @@ def chain_to_text(chain: list) -> str:
         if is_last:
             lines.append(f"  Speaking style:")
         else:
-            style = (utt.get("text_description") or "unknown").strip()
+            style = (utt.get("text_description") if isinstance(utt.get("text_description"), str) else None) or "unknown"
+            style = style.strip()
             lines.append(f"  Speaking style: {style}")
 
     return "\n".join(lines)
@@ -71,7 +72,9 @@ def build_few_shot_example(chain: list) -> str:
     lines = []
     for i, utt in enumerate(chain):
         text  = utt.get("transcription", "").strip()
-        style = (utt.get("text_description") or "unknown").strip()
+        style = (utt.get("text_description") if isinstance(utt.get("text_description"), str) else None) or "unknown"
+        style = style.strip()
+
 
         lines.append(f"[Turn {i+1}]")
         lines.append(f"  Transcription: \"{text}\"")

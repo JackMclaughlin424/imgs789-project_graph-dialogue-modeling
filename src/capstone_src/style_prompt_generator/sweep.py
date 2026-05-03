@@ -193,37 +193,46 @@ def _train_final_and_eval_test(
         num_turns=cfg["num_turns"],
         max_len_sec=cfg["max_len_sec"],
     )
+    
+    train_ds   = ConvoStyleDataset(**ds_kwargs, allowed_conv_ids=trainval_ids)
+    log.info("Final train_ds chain count: %d", len(train_ds))
+    
     loader_kw  = dict(collate_fn=collate_pad, num_workers=cfg["num_workers"], pin_memory=True)
     g          = torch.Generator().manual_seed(cfg["seed"])
-    train_ds   = ConvoStyleDataset(**ds_kwargs, allowed_conv_ids=trainval_ids)
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, generator=g, **loader_kw)
+    
 
 
     model = build_model(cfg, device, log)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     total_steps = len(train_loader) * cfg["num_epochs"]
     optimizer, scheduler = build_optimizer_and_scheduler(model, cfg, total_steps, log)
 
+    t0_train = time.time()
     for epoch in range(cfg["num_epochs"]):
         _, global_step = run_epoch(
             model, train_loader, optimizer, scheduler,
             device, cfg, epoch, global_step, wandb_run=None, log_handler=log,
             is_train=True, use_tqdm=False
         )
+    training_time = time.time() - t0_train
 
     log.info("Evaluating generation...")
     model.eval()
     metrics = eval_test_by_source(
         model, cfg, test_chains_by_source, device, log
     )
-
+    inference_time = sum(m.get("inference_time_s", 0.0) for m in metrics.values())
 
     del train_loader
     del model, optimizer, scheduler
     gc.collect()
     torch.cuda.empty_cache()
 
-    return metrics, global_step
+    return metrics, global_step, training_time, inference_time, trainable_params
+
+
 
 
 
@@ -303,11 +312,13 @@ def _make_sweep_fn(base_cfg: dict, n_folds: int, overrides: list | None = None):
 
         global_step = 0
         fold_metrics = []
+        t0_train = time.time()
         for fold_idx, (train_ids, val_ids) in enumerate(fold_splits):
             log.info(f"=== Fold {fold_idx+1}/{len(fold_splits)} ===")
             metrics, global_step = _train_fold(cfg, train_ids, val_ids, fold_idx, run, device, global_step)
             fold_metrics.append(metrics)
             log.info(f"Fold {fold_idx+1}  val_loss={metrics['val_loss']:.4f}  ")
+        training_time = time.time() - t0_train
 
 
         # aggregate across folds (the sweep optimises this)
@@ -339,7 +350,7 @@ def _make_sweep_fn(base_cfg: dict, n_folds: int, overrides: list | None = None):
 
 
         
-        test_metrics, global_step = _train_final_and_eval_test(
+        test_metrics, global_step, _, _, _ = _train_final_and_eval_test(
             cfg, trainval_ids, test_chains_by_source, run, device, global_step
         )
 
