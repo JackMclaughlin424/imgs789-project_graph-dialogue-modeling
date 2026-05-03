@@ -31,12 +31,14 @@ import itertools
 
 from capstone_src.style_prompt_generator.model.train_helpers import (
     load_config, apply_overrides, set_seed,
-    build_model, build_optimizer_and_scheduler,
-    wandb_log, eval_test_by_source,
+     build_optimizer_and_scheduler,wandb_log, 
     assert_no_test_leakage
 )
 
-from capstone_src.style_prompt_generator.train import run_epoch
+from model.graph_model_helpers import (
+    run_epoch, build_model, eval_test_by_source
+)
+
 from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
 from torch.utils.data import DataLoader
 
