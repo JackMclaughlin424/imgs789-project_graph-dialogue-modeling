@@ -37,7 +37,7 @@ from capstone_src.style_prompt_generator.model.train_helpers import (
     assert_no_test_leakage
 )
 
-from model.graph_model_helpers import (
+from graph_model.graph_model_helpers import (
     run_epoch, build_model, eval_test_by_source
 )
 

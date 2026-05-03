@@ -13,8 +13,8 @@ from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import (
     ConvoStyleDataset, collate_pad
 )
 
-from model.DialogueGraph import DialogueGraph
-from model.GraphStylePromptGenerator import build_style_generator, GraphStylePrompt
+from graph_model.DialogueGraph import DialogueGraph
+from graph_model.GraphStylePromptGenerator import build_style_generator, GraphStylePrompt
 
 
 import torch

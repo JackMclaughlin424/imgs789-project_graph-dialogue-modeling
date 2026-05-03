@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from model.DialogueGraph import DialogueGraph
+from graph_model.DialogueGraph import DialogueGraph
 
 
 # not really used, these are controlled via config parameters now
