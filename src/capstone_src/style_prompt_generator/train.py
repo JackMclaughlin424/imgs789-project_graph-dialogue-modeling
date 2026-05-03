@@ -17,7 +17,7 @@ import torch.nn as nn
 
 import pandas as pd
 
-from model.StylePromptGenerator import (
+from capstone_src.style_prompt_generator.model.StylePromptGenerator import (
     SCFAWithStyleHead
 )
 
