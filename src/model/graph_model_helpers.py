@@ -9,8 +9,6 @@ from capstone_src.style_prompt_generator.model.train_helpers import (
     , wandb_finish, wandb_init, wandb_log
 )
 
-from capstone_src.style_prompt_generator.train import _grad_norm
-
 from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import (
     ConvoStyleDataset, collate_pad
 )
@@ -88,6 +86,16 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> GraphStylePro
     log.info(f"Trainable parameters: {trainable_params:,}")
 
     return model
+
+
+def _grad_norm(model: nn.Module) -> float:
+    """Compute global L2 norm of all gradients. Useful for diagnosing training stability."""
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().norm(2).item() ** 2
+    return total ** 0.5
+
 
 
 def compute_loss(
