@@ -9,8 +9,6 @@
     "num_workers": 0,
     "num_turns": 3,
     "_comment_param_section_encoder": "Dialogue encoder parameters",
-    "num_unfrozen_bert": 1,
-    "num_unfrozen_wavlm": 1,
     "d_feat": 256,
     "d_model": 768,
     "d_out": 256,

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from model.DialogueEncoder import SCFA, DialoguePooler
+from capstone_src.style_prompt_generator.model.DialogueEncoder import SCFA, DialoguePooler
 
 
 # not really used, these are controlled via config parameters now
