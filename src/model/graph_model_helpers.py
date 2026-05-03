@@ -83,7 +83,7 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> GraphStylePro
         system_prompt=cfg["system_prompt"],
         device=device,
         torch_dtype=torch.bfloat16,
-    )
+    ).to(device)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Trainable parameters: {trainable_params:,}")

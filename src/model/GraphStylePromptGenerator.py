@@ -191,6 +191,7 @@ def build_style_generator(
         nhead=nhead,
     )
 
+
     generator = StylePromptGenerator(
         style_head=head,
         tokenizer=tokenizer,
