@@ -347,7 +347,7 @@ def build_dataloaders(cfg: Dict[str, Any], log):
 
 # Optimizer + scheduler
 
-def build_optimizer_and_scheduler(model: SCFAWithStyleHead, cfg: Dict[str, Any], total_steps: int, log):
+def build_optimizer_and_scheduler(model, cfg: Dict[str, Any], total_steps: int, log):
     # only optimize parameters that require gradients
     # (LLM is frozen inside StylePromptGenerator; backbone layers may be partially frozen)
     trainable = [p for p in model.parameters() if p.requires_grad]

@@ -21,7 +21,7 @@ from model.train_helpers import (
 
 
 from baseline import load_llm, build_system_prompt, build_user_prompt, batch_query_llm, LLM_REPO
-from sweep import _train_final_and_eval_test
+from scripts.sweep_graph import _train_final_and_eval_test
 from dataset.ConvoStyleDataset import ConvoStyleDataset
 
 
