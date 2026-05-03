@@ -28,21 +28,22 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-from dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
-from model.DialogueEncoder import (
+from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
+from capstone_src.style_prompt_generator.model.DialogueEncoder import (
     DualModalityEmbedder,
     SCFA,
     DialoguePooler,
     SelfAttentivePooling,
     ModalityEncoder,
 )
-from model.GraphStylePromptGenerator import (
+from capstone_src.style_prompt_generator.model.StylePromptGenerator import (
     StylePromptHead,
     StylePromptGenerator,
     SCFAWithStyleHead,
     LLM_REPO,
     LLM_DIM,
 )
+
 
 # defaults
 
