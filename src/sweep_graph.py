@@ -30,7 +30,7 @@ import time
 import itertools
 
 from capstone_src.style_prompt_generator.model.train_helpers import (
-    load_config, apply_overrides, set_seed,
+    apply_overrides, set_seed,
      build_optimizer_and_scheduler,wandb_log, 
     assert_no_test_leakage
 )
@@ -396,9 +396,11 @@ def main():
     parser.add_argument("--override",    nargs="*", metavar="KEY=VALUE",
                         help="Override base config fields (same syntax as train.py).")
     args = parser.parse_args()
+    
 
-    base_cfg = load_config(args.config)
-
+    with open(args.config) as f:
+        base_cfg = json.load(f)
+   
     with open(args.sweep_values) as f:
         sweep_config = json.load(f)
 

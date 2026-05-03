@@ -6,7 +6,7 @@ from capstone_src.style_prompt_generator.model.train_helpers import (
     _flatten,
     compute_bertscore, compute_meteor, compute_chrf
     , compute_rouge, compute_tag_f1, compute_dist, compute_pred_semantic_sim
-    , wandb_finish, wandb_init, wandb_log
+    ,wandb_log
 )
 
 from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import (
@@ -26,6 +26,9 @@ from typing import Dict, Any
 
 import gc
 import time
+
+
+
 
 def build_text_encoder(cfg: Dict[str, Any], device: torch.device, log):
     """Load BERT, freeze all layers, then optionally unfreeze the top N."""
