@@ -28,10 +28,6 @@ def build_text_encoder(cfg: Dict[str, Any], device: torch.device, log):
     tokenizer = AutoTokenizer.from_pretrained(BERT_REPO)
     model = AutoModel.from_pretrained(BERT_REPO).to(device)
 
-    _unfreeze_top_n_layers(model, "encoder.layer", cfg["num_unfrozen_bert"], log)
-
-    n = cfg["num_unfrozen_bert"]
-    log.info(f"BERT: {n} encoder layer(s) unfrozen")
     return model, tokenizer
 
 
@@ -43,10 +39,6 @@ def build_audio_encoder(cfg: Dict[str, Any], device: torch.device, log):
     processor = AutoFeatureExtractor.from_pretrained(WAVLM_REPO)
     model = WavLMModel.from_pretrained(WAVLM_REPO).to(device)
 
-    _unfreeze_top_n_layers(model, "encoder.layers", cfg["num_unfrozen_wavlm"], log)
-
-    n = cfg["num_unfrozen_wavlm"]
-    log.info(f"WavLM: {n} encoder layer(s) unfrozen")
     return model, processor
 
 
@@ -56,31 +48,8 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> DialogueGraph
     text_backbone, tokenizer = build_text_encoder(cfg, device, log)
     audio_backbone, processor = build_audio_encoder(cfg, device, log)
 
+    dialogue_graph = DialogueGraph()    # fill in
 
-    embedder = DualModalityEmbedder(
-        text_encoder_model_pretrained=text_backbone,
-        audio_encoder_model_pretrained=audio_backbone,
-        tokenizer=tokenizer,
-        processor=processor,
-        SAMPLE_RATE=cfg["sample_rate"],
-    )
-
-    scfa = SCFA(
-        max_turns=cfg["num_turns"],
-        embedder=embedder,
-        d_model=cfg["d_model"],
-        num_ctx_layers=cfg["num_ctx_layers"],
-        num_spk_layers=cfg["num_spk_layers"],
-        dim_feedforward=cfg["dim_feedforward"],
-        nhead=cfg["nhead"],
-        dropout=cfg["dropout"],
-    ).to(device)
-
-    # 4 * d_model because SCFA cats [z_audio, z_text, z_audio_fused, z_text_fused]
-    pooler = DialoguePooler(
-        d_model=cfg["d_model"] * 4,
-        mode=cfg["dialogue_pooler"],
-    ).to(device)
 
     # LLM embedding dim is fixed at LLM_DIM
     head = StylePromptHead(

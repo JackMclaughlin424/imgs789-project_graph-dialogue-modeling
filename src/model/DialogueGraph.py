@@ -383,3 +383,4 @@ class DialogueGraph(nn.Module):
 
         # --- final projection ---
         return self.out_proj(torch.cat([current_h, context_vec], dim=-1))  # (B, d_out)
+
