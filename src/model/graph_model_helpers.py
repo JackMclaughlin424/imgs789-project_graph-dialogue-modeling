@@ -336,7 +336,8 @@ def eval_test_by_source(
                         text_only = torch.ones_like(text_only)
                     
                     vec = model.dialogue_graph(audio, lengths, texts, speaker_ids, text_only)
-                    all_vecs.append(vec.float().detach().cpu())
+                    all_vecs.append(vec.bfloat16().detach().cpu())
+
                     
                     preds = model.style_generator.generate(vec)
                     del vec

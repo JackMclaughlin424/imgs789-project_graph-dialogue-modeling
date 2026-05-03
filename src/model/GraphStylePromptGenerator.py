@@ -12,7 +12,7 @@ LLM_REPO = "meta-llama/Llama-3.2-3B-Instruct"  # or whichever you choose
 LLM_DIM  = 3072  # must match model's hidden_size
 
 
-def load_tinyllama(device: str = "cpu", torch_dtype=torch.float32):
+def load_tinyllama(device: str = "cpu", torch_dtype=torch.bfloat16):
     tokenizer = AutoTokenizer.from_pretrained(LLM_REPO)
     model = AutoModelForCausalLM.from_pretrained(LLM_REPO, torch_dtype=torch_dtype)
     model = model.to(device)
@@ -180,7 +180,7 @@ def build_style_generator(
     max_prompt_tokens:  int           = 128,
     system_prompt:      Optional[str] = None,
     device:             str           = "cpu",
-    torch_dtype                        = torch.float32,
+    torch_dtype                        = torch.bfloat16,
 ) -> "GraphStylePrompt":
     tokenizer, llm = load_tinyllama(device=device, torch_dtype=torch_dtype)
 
