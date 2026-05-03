@@ -58,6 +58,11 @@ def build_model(cfg: Dict[str, Any], device: torch.device, log) -> GraphStylePro
     text_backbone, tokenizer = build_text_encoder(cfg, device, log)
     audio_backbone, processor = build_audio_encoder(cfg, device, log)
 
+    for p in text_backbone.parameters():
+        p.requires_grad = False
+    for p in audio_backbone.parameters():
+        p.requires_grad = False
+
     dialogue_graph = DialogueGraph(
         bert_model=text_backbone,
         wavlm_model=audio_backbone,
