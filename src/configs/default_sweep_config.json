@@ -10,7 +10,7 @@
     "num_turns": 3,
     "_comment_param_section_encoder": "Dialogue encoder parameters",
     "d_feat": 256,
-    "d_model": 768,
+    "d_model": 128,
     "d_out": 256,
     "attn_dim": 128,
     "num_gcn_layers": 1,

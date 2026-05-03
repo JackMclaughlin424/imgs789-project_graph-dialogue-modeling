@@ -354,7 +354,7 @@ class DialogueGraph(nn.Module):
         text_only:    Optional[torch.Tensor] = None,   # (B, T) bool
         context_mask: Optional[torch.Tensor] = None,   # (B, T-1) bool, True = real turn
     ) -> torch.Tensor:
-        # --- feature extraction ---
+        # feature extraction 
         feats = self.extractor(audio, lengths, texts, text_only)  # (B, T, 2*d_feat)
         h     = self.input_proj(feats)                            # (B, T, d_model)
 
@@ -370,7 +370,7 @@ class DialogueGraph(nn.Module):
             )
             return self.out_proj(torch.cat([current_h, zeros], dim=-1))
 
-        # --- DialogueGCN over context nodes ---
+        # DialogueGCN over context nodes 
         context_speaker_ids = [s[:-1] for s in speaker_ids]  # drop anchor from each item
         g = self.gcn(context_h, context_speaker_ids)          # (B, N, d_model)
 
@@ -378,9 +378,9 @@ class DialogueGraph(nn.Module):
         # the original pre-GCN embedding so the attention can use both representations
         kv = torch.cat([g, context_h], dim=-1)  # (B, N, 2*d_model)
 
-        # --- attention pooling ---
+        # attention pooling 
         context_vec, _ = self.context_attn(current_h, kv, context_mask)  # (B, 2*d_model)
 
-        # --- final projection ---
+        # final projection 
         return self.out_proj(torch.cat([current_h, context_vec], dim=-1))  # (B, d_out)
 
