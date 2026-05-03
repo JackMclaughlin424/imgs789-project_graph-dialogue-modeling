@@ -28,6 +28,8 @@ import json
 import os
 import time
 import itertools
+import sys
+
 
 from capstone_src.style_prompt_generator.model.train_helpers import (
     apply_overrides, set_seed,
@@ -42,11 +44,22 @@ from model.graph_model_helpers import (
 from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
 from torch.utils.data import DataLoader
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+_on_colab = "google.colab" in sys.modules or os.path.isdir("/content")
+
+if _on_colab:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+        stream=sys.stdout,
+    )
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 log = logging.getLogger(__name__)
 
 # write our logs to a file independent of wandb's stderr capture
@@ -54,6 +67,7 @@ _log_file = os.environ.get("SLURM_JOB_LOG", "sweep_run.log")
 _fh = logging.FileHandler(_log_file, mode="a")
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S"))
 logging.getLogger().addHandler(_fh)
+
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -250,7 +264,8 @@ def _make_sweep_fn(base_cfg: dict, n_folds: int, overrides: list | None = None):
         gc.collect()
         torch.cuda.empty_cache()
         # sweep.py, line 242
-        run = wandb.init(settings=wandb.Settings(console="off", init_timeout=300))
+        _settings = wandb.Settings(init_timeout=300) if _on_colab else wandb.Settings(console="off", init_timeout=300)
+        run = wandb.init(settings=_settings)
 
         cfg = deepcopy(base_cfg)
 
