@@ -136,7 +136,7 @@ class _UtteranceFeatureExtractor(nn.Module):
         raw_mask = (
             torch.arange(audio_t.shape[1], device=device).unsqueeze(0)
             < lengths_t.to(device).unsqueeze(1)
-        ).bfloat16()
+        ).float()
         mask_ds  = F.interpolate(raw_mask.unsqueeze(1), size=T_out, mode="nearest").squeeze(1).bool()
 
         return self.audio_pool(hidden, mask_ds)  # (B, 768)
