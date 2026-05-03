@@ -17,7 +17,7 @@ import torch.nn as nn
 
 import pandas as pd
 
-from model.StylePromptGenerator import (
+from model.GraphStylePromptGenerator import (
     SCFAWithStyleHead
 )
 

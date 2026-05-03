@@ -36,7 +36,7 @@ from model.DialogueEncoder import (
     SelfAttentivePooling,
     ModalityEncoder,
 )
-from model.StylePromptGenerator import (
+from model.GraphStylePromptGenerator import (
     StylePromptHead,
     StylePromptGenerator,
     SCFAWithStyleHead,

@@ -35,7 +35,7 @@ class StylePromptHead(nn.Module):
 
     def __init__(
         self,
-        d_model:            int,
+        d_in:               int,
         num_prefix_tokens:  int,
         llm_dim:            int   = LLM_DIM,
         num_mapping_layers: int   = 4,
@@ -43,25 +43,12 @@ class StylePromptHead(nn.Module):
         dropout:            float = 0.1,
     ):
         super().__init__()
-
         self.num_prefix_tokens = num_prefix_tokens
-
-        self.stream_compressors = nn.ModuleList([
-            nn.Linear(d_model, d_model // 2) for _ in range(4)
-        ])
-        
-
-        self.stream_to_llm = nn.ModuleList([
-            nn.Linear(d_model // 2, llm_dim) for _ in range(4)
-        ])
-
-
-
+        self.ctx_proj = nn.Linear(d_in, llm_dim)
         self.prefix_const = nn.Parameter(torch.randn(num_prefix_tokens, llm_dim) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=llm_dim,
             nhead=nhead,
-            # dim_feedforward=llm_dim * 2,  # use default 2048, matching papers
             dropout=dropout,
             batch_first=True,
         )
@@ -69,22 +56,14 @@ class StylePromptHead(nn.Module):
 
 
 
+
     def forward(self, dialogue_vec: torch.Tensor) -> torch.Tensor:
-        
-        B, D = dialogue_vec.shape
-        d_model = D // 4
-
-        # split back into the 4 SCFA streams and compress each independently 
-        # to create distinct context tokens
-        streams    = dialogue_vec.split(d_model, dim=-1)
-        compressed = [F.relu(comp(s)) for comp, s in zip(self.stream_compressors, streams)]
-        ctx_tokens = torch.stack([proj(c) for proj, c in zip(self.stream_to_llm, compressed)], dim=1)  # (B, 4, llm_dim)
-
-        # z sits at position 0; learnable constants learn to query it
-        consts     = self.prefix_const.unsqueeze(0).expand(B, -1, -1)
-        seq        = torch.cat([ctx_tokens, consts], dim=1)   # (B, 4+K, llm_dim)
+        B = dialogue_vec.shape[0]
+        ctx_token  = self.ctx_proj(dialogue_vec).unsqueeze(1)           # (B, 1, llm_dim)
+        consts     = self.prefix_const.unsqueeze(0).expand(B, -1, -1)   # (B, K, llm_dim)
+        seq        = torch.cat([ctx_token, consts], dim=1)              # (B, 1+K, llm_dim)
         out        = self.transformer(seq)
-        return out[:, 4:, :]# drop z position, return K prefix vectors
+        return out[:, 1:, :]                                            # drop ctx position, return K prefix vectors
 
 
 
@@ -174,55 +153,39 @@ class GraphStylePrompt(nn.Module):
         style_generator: StylePromptGenerator,
     ):
         super().__init__()
-        self.scfa            = scfa
-        self.pooler          = pooler
+        self.dialogue_graph = dialogue_graph
         self.style_generator = style_generator
 
     def forward(
         self,
-        audio:       torch.Tensor,
-        lengths:     torch.Tensor,
+        audio:        torch.Tensor,
+        lengths:      torch.Tensor,
         texts,
         speaker_ids,
-        text_only:   Optional[torch.Tensor] = None,
+        text_only:    Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
     ):
-        # (B, T, 4*d_model)
-        dialogue_ctx = self.scfa(audio, lengths, texts, speaker_ids, text_only)
-        # (B, 4*d_model)
-        dialogue_vec = self.pooler(dialogue_ctx)
+        dialogue_vec  = self.dialogue_graph(audio, lengths, texts, speaker_ids, text_only, context_mask)
         style_prompts = self.style_generator(dialogue_vec)
-
         return style_prompts, dialogue_vec
 
 
 def build_style_generator(
-    scfa:               "SCFA",
-    pooler:             "DialoguePooler",
-    d_model:            int           = 768,
+    dialogue_graph:     DialogueGraph,
+    d_out:              int           = 256,
     num_prefix_tokens:  int           = 10,
     num_mapping_layers: int           = 8,
     nhead:              int           = 8,
     max_new_tokens:     int           = 80,
+    max_prompt_tokens:  int           = 128,
     system_prompt:      Optional[str] = None,
     device:             str           = "cpu",
     torch_dtype                        = torch.float32,
-) -> SCFAWithStyleHead:
-    # Loads TinyLlama, wires everything up, returns a ready-to-use SCFAWithStyleHead.
-    #
-    # pooler should be a DialoguePooler instance configured with your chosen mode.
-    #
-    # system_prompt controls text conditioning after the prefix:
-    #   None -> prefix-only generation (ClipCap / StyleCap style)
-    #   str  -> prefix + text anchor
-    #
-    # Example:
-    #   pooler = DialoguePooler(d_model=768 * 4, mode="attentive")
-    #   model  = build_style_generator(scfa, pooler, device="cuda")
-    #   style_prompts, vec = model(audio, lengths, texts, speaker_ids)
+) -> "GraphStylePrompt":
     tokenizer, llm = load_tinyllama(device=device, torch_dtype=torch_dtype)
 
     head = StylePromptHead(
-        d_model=d_model,
+        d_in=d_out,
         num_prefix_tokens=num_prefix_tokens,
         num_mapping_layers=num_mapping_layers,
         nhead=nhead,
@@ -232,8 +195,9 @@ def build_style_generator(
         style_head=head,
         tokenizer=tokenizer,
         llm=llm,
+        max_prompt_tokens=max_prompt_tokens,
         system_prompt=system_prompt,
         max_new_tokens=max_new_tokens,
     )
 
-    return SCFAWithStyleHead(scfa=scfa, pooler=pooler, style_generator=generator)
+    return GraphStylePrompt(dialogue_graph=dialogue_graph, style_generator=generator)
