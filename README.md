@@ -147,7 +147,7 @@ Conversation (T turns of text + audio)
 ## Experiments
 
 - Number of turns in dialogue
-- 
+- Number mapping layers in style prompt head
 
 ## Prior/Inspiring Work
 

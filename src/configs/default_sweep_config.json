@@ -18,7 +18,7 @@
     "llm_repo": "meta-llama/Llama-3.2-3B-Instruct",
     "llm_dim": 3072,
     "mapping_nhead": 8,
-    "num_mapping_layers": 4,
+    "num_mapping_layers": 2,
     "max_prompt_tokens": 128,
     "max_style_desc_tokens": 50,
     "max_new_tokens": 50,
