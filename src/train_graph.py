@@ -135,13 +135,6 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
 
         wandb_log({"epoch/train_loss": train_loss}, step=global_step, run=wandb_run)
 
-        if (epoch + 1) % cfg["save_every_n_epochs"] == 0:
-            save_checkpoint(
-                model, optimizer, scheduler, epoch,
-                global_step, train_loss, cfg, out_dir, log,
-            )
-            prune_old_checkpoints(out_dir, cfg["keep_last_n_ckpts"], log)
-
     final_path = out_dir / "final_model.pt"
     torch.save(model.state_dict(), final_path)
     log.info(f"Final model saved: {final_path}")
