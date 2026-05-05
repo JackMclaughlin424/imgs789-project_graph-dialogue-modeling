@@ -39,23 +39,35 @@ from capstone_src.style_prompt_generator.model.train_helpers import (
 from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
 from torch.utils.data import DataLoader
 
+_on_colab = "google.colab" in sys.modules or os.path.isdir("/content")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+if _on_colab:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+        stream=sys.stdout,
+    )
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 log = logging.getLogger(__name__)
 
-_log_file = os.environ.get("SLURM_JOB_LOG", "train.log")
+# write our logs to a file independent of wandb's stderr capture
+_log_file = os.environ.get("SLURM_JOB_LOG", "sweep_run.log")
 _fh = logging.FileHandler(_log_file, mode="a")
 _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S"))
 logging.getLogger().addHandler(_fh)
 
+
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-
 
 
 
