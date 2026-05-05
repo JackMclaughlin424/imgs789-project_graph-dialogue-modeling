@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module=r"torch\._inducto
 import os, time
 
 from capstone_src.style_prompt_generator.model.train_helpers import (
-     load_config, apply_overrides, set_seed,
+    apply_overrides, set_seed,
     build_optimizer_and_scheduler,
     wandb_log, build_dataloaders, wandb_init, load_checkpoint, save_checkpoint, prune_old_checkpoints, wandb_finish
 )
@@ -138,7 +138,9 @@ def main():
                         help="Ignore existing checkpoints and train from scratch.")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    with open(args.config) as f:
+        cfg = json.load(f)
+        
     apply_overrides(cfg, args.override, log)
     train(cfg, resume=not args.no_resume)
 
