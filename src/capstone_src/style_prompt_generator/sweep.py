@@ -37,7 +37,7 @@ from model.train_helpers import (
     assert_no_test_leakage
 )
 
-from train import run_epoch
+from train_graph import run_epoch
 from dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
 from torch.utils.data import DataLoader
 

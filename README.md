@@ -146,8 +146,27 @@ Conversation (T turns of text + audio)
 
 ## Experiments
 
-- Number of turns in dialogue
-- Number mapping layers in style prompt head
+### Fixed parameters, controlled to test against Transformer capstone architecture 
+| Parameter     | Value  |
+|---------------|----------|
+| Num_turns       | 3      |
+| Mapping layers       | 2      |
+| Num prefix tokens       | 10      |
+| batch size       | 16      |
+
+
+### Hyperparameter sweep results
+| Parameter     | Value Selected |
+|---------------|----------|
+| dropout       | 0.3      |
+| lr_schedule   | linear   |
+| warmup_ratio  | 0.2 |
+| weight_decay  | 0.0025 |
+| learning_rate | 0.0002 |
+| Epochs        |   12   |
+
+
+### Fail case analysis
 
 ## Prior/Inspiring Work
 
