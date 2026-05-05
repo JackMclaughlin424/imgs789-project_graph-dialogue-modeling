@@ -14,7 +14,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-
+import numpy as np
 import pandas as pd
 
 from graph_model.graph_model_helpers import (
@@ -34,8 +34,10 @@ import os, time
 from capstone_src.style_prompt_generator.model.train_helpers import (
     apply_overrides, set_seed,
     build_optimizer_and_scheduler,
-    wandb_log, build_dataloaders, wandb_init, load_checkpoint, save_checkpoint, prune_old_checkpoints, wandb_finish
+    wandb_log, wandb_init, load_checkpoint, save_checkpoint, prune_old_checkpoints, wandb_finish
 )
+from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import ConvoStyleDataset, collate_pad
+from torch.utils.data import DataLoader
 
 
 logging.basicConfig(
@@ -58,7 +60,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 def train(cfg: Dict[str, Any], resume: bool = True) -> None:
-    """Train SCFAWithStyleHead; saves final weights to output_dir/final_model.pt."""
+    """Train the graph model; saves final weights to output_dir/final_model.pt."""
     set_seed(cfg["seed"])
 
     out_dir = Path(cfg["output_dir"])
@@ -67,14 +69,40 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
 
-    train_loader, _, _ = build_dataloaders(cfg, log)
-    model              = build_model(cfg, device, log)
+    _, test_conv_ids = ConvoStyleDataset.make_fixed_test_split(
+        h5_path=cfg["h5_path"],
+        meta_path=cfg["meta_path"],
+        meta_columns=["transcription", "text_description", "source"],
+        sample_rate=cfg["sample_rate"],
+        max_len_sec=cfg["max_len_sec"],
+        num_turns=cfg["num_turns"],
+    )
+    meta = pd.read_parquet(cfg["meta_path"], columns=["conv_id"])
+    train_ids = set(c for c in meta["conv_id"].unique() if c not in test_conv_ids)
 
-    total_steps            = len(train_loader) * cfg["num_epochs"]
-    optimizer, scheduler   = build_optimizer_and_scheduler(model, cfg, total_steps, log)
+    train_ds = ConvoStyleDataset(
+        h5_path=cfg["h5_path"],
+        meta_path=cfg["meta_path"],
+        meta_columns=["transcription", "text_description", "source"],
+        sample_rate=cfg["sample_rate"],
+        num_turns=cfg["num_turns"],
+        max_len_sec=cfg["max_len_sec"],
+        allowed_conv_ids=train_ids,
+    )
+    g = torch.Generator().manual_seed(cfg["seed"])
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg["batch_size"], shuffle=True, generator=g,
+        collate_fn=collate_pad, num_workers=cfg["num_workers"], pin_memory=True,
+    )
+    log.info(f"{len(train_ds)} train chains")
 
-    start_epoch  = 0
-    global_step  = 0
+    model = build_model(cfg, device, log)
+
+    total_steps          = len(train_loader) * cfg["num_epochs"]
+    optimizer, scheduler = build_optimizer_and_scheduler(model, cfg, total_steps, log)
+
+    start_epoch = 0
+    global_step = 0
 
     if resume:
         ckpts = sorted(out_dir.glob("ckpt_epoch*.pt"))
@@ -86,20 +114,13 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
 
     wandb_run = wandb_init(cfg, log)
 
-    patience          = cfg.get("early_stopping_patience", 3)
-    min_delta         = cfg.get("early_stopping_min_delta", 1e-4)
-    MIN_EPOCH         = 5
-    best_loss         = float("inf")
-    epochs_no_improve = 0
-
     for epoch in range(start_epoch, cfg["num_epochs"]):
         train_loss, global_step = run_epoch(
             model, train_loader, optimizer, scheduler,
             device, cfg, epoch, global_step, wandb_run=wandb_run,
-            is_train=True, use_tqdm=False,
+            is_train=True, use_tqdm=True,
         )
 
-        # epoch-level summary (step-level metrics are logged inside run_epoch)
         wandb_log({"epoch/train_loss": train_loss}, step=global_step, run=wandb_run)
 
         if (epoch + 1) % cfg["save_every_n_epochs"] == 0:
@@ -109,21 +130,12 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
             )
             prune_old_checkpoints(out_dir, cfg["keep_last_n_ckpts"], log)
 
-        if train_loss < best_loss - min_delta:
-            best_loss         = train_loss
-            epochs_no_improve = 0
-        elif patience > 0 and epoch >= MIN_EPOCH:
-            epochs_no_improve += 1
-
-        if patience > 0 and epoch >= MIN_EPOCH and epochs_no_improve >= patience:
-            log.info(f"Early stopping at epoch {epoch + 1} (no improvement for {patience} epochs)")
-            break
-
     final_path = out_dir / "final_model.pt"
     torch.save(model.state_dict(), final_path)
     log.info(f"Final model saved: {final_path}")
 
     wandb_finish(wandb_run)
+
 
 
 
