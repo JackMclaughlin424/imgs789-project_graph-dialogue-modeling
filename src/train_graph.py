@@ -130,7 +130,7 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
         train_loss, global_step = run_epoch(
             model, train_loader, optimizer, scheduler,
             device, cfg, epoch, global_step, wandb_run=wandb_run,
-            is_train=True, use_tqdm=True,
+            is_train=True, use_tqdm=True, log_handler=log
         )
 
         wandb_log({"epoch/train_loss": train_loss}, step=global_step, run=wandb_run)
