@@ -17,13 +17,12 @@ import torch.nn as nn
 
 import pandas as pd
 
-from capstone_src.style_prompt_generator.model.StylePromptGenerator import (
-    SCFAWithStyleHead
+from graph_model.graph_model_helpers import (
+    run_epoch, build_model
 )
 
 import sys
 
-from tqdm.auto import tqdm
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module=r"torch\._dynamo")
@@ -34,9 +33,10 @@ import os, time
 
 from capstone_src.style_prompt_generator.model.train_helpers import (
      load_config, apply_overrides, set_seed,
-    build_model, build_optimizer_and_scheduler,
+    build_optimizer_and_scheduler,
     wandb_log, build_dataloaders, wandb_init, load_checkpoint, save_checkpoint, prune_old_checkpoints, wandb_finish
 )
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,200 +55,6 @@ logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
-
-# Loss
-
-def compute_loss(
-    model: SCFAWithStyleHead,
-    batch: Dict[str, Any],
-    device: torch.device,
-    cfg: Dict[str, Any],
-) -> torch.Tensor:
-    """
-    Teacher-forced cross-entropy over the style prompt tokens.
-
-    The LLM is frozen, so we only flow gradients through the mapping network
-    (StylePromptHead), SCFA model, and optionally the unfrozen layers of BERT and WavLM.
-    """
-    audio      = batch["audio"].to(device)        # (B, T, samples)
-    lengths    = batch["lengths"].to(device)      # (B, T)
-    text_only  = batch["text_only"].to(device)    # (B, T)
-    texts      = batch["transcription"]           # list[B][T]
-    speaker_ids = batch["speaker_id"]             # list[B][T]
-    targets    = batch["text_description"]            # list[B][T] -- we want the anchor turn's prompt
-
-    # anchor is always the last turn
-    anchor_prompts = [chain[-1] for chain in targets]  # list[B]
-
-    # anchor (last turn) is always text-only: predicting style for audio not yet recorded
-    audio[:, -1, :] = 0
-    lengths[:, -1]  = 0
-    text_only[:, -1] = True
-
-
-    #
-    #   RUNNING MODEL
-    #
-
-    # Encode turns with context + speaker information
-    dialogue_ctx = model.scfa(audio, lengths, texts, speaker_ids, text_only)
-    # pool embeddings
-    dialogue_vec = model.pooler(dialogue_ctx)
-    # get prefix embeddings from the style head
-    prefix_embeds = model.style_generator.style_head(dialogue_vec)  # (B, K, TINYLLAMA_DIM)
-
-    if torch.isnan(prefix_embeds).any():
-        log.warning(f"NaN in prefix_embeds! dialogue_vec nan={torch.isnan(dialogue_vec).any()}")
-        return torch.tensor(float('nan'), device=device, requires_grad=True)
-
-    B = prefix_embeds.shape[0]
-    K = prefix_embeds.shape[1]
-
-    # tokenize the target style descriptions
-    tokenizer = model.style_generator.tokenizer
-    llm       = model.style_generator.llm
-
-    target_tokens = tokenizer(
-        anchor_prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=cfg["max_style_desc_tokens"],
-    )
-    input_ids = target_tokens.input_ids.to(device)   # (B, L)
-    attn_mask = target_tokens.attention_mask.to(device)
-
-    # embed target tokens for teacher forcing
-    token_embeds = llm.get_input_embeddings()(input_ids)  # (B, L, TINYLLAMA_DIM)
-
-    # optionally prepend system prompt, skip if empty string
-    if model.style_generator.system_prompt:
-        prompt_tokens = tokenizer(
-            [model.style_generator.system_prompt] * B,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=cfg["max_style_desc_tokens"],
-        )
-        prompt_embeds = llm.get_input_embeddings()(prompt_tokens.input_ids.to(device))
-
-        input_embeds = torch.cat([prefix_embeds, prompt_embeds, token_embeds], dim=1)
-        prefix_mask  = torch.ones(B, K + prompt_embeds.shape[1], dtype=torch.long, device=device)
-        full_mask    = torch.cat([prefix_mask, attn_mask], dim=1)
-    else:
-        input_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
-        prefix_mask  = torch.ones(B, K, dtype=torch.long, device=device)
-        full_mask    = torch.cat([prefix_mask, attn_mask], dim=1)
-
-    # build labels: -100 for prefix positions (not supervised), token ids elsewhere
-    prefix_labels = torch.full((B, input_embeds.shape[1] - input_ids.shape[1]), -100, device=device)
-    token_labels  = input_ids.masked_fill(attn_mask == 0, -100)
-    labels        = torch.cat([prefix_labels, token_labels], dim=1)
-
-    valid_label_count = (labels != -100).sum()
-    if valid_label_count == 0:
-        log.warning(f"All labels are -100! anchor_prompts sample: {anchor_prompts[0]!r}")
-
-    # cast input embeddings to TinyLlama dtype bf16
-    input_embeds = input_embeds.to(llm.dtype)
-
-    if torch.isnan(input_embeds).any() or torch.isinf(input_embeds).any():
-        log.warning(f"NaN/Inf in input_embeds after dtype cast. Max abs: {input_embeds.abs().max().item():.2e}")
-
-    outputs = llm(
-        inputs_embeds=input_embeds,
-        attention_mask=full_mask,
-        labels=labels,
-    )
-
-    return outputs.loss
-
-
-
-
-
-# Training loop
-
-def _grad_norm(model: nn.Module) -> float:
-    """Compute global L2 norm of all gradients. Useful for diagnosing training stability."""
-    total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total += p.grad.detach().norm(2).item() ** 2
-    return total ** 0.5
-
-
-def run_epoch(
-    model, loader, optimizer, scheduler, 
-    device, cfg, epoch, global_step, wandb_run, log_handler=log
-    , is_train=True, use_tqdm=True
-) -> tuple[float, int]:
-    model.train(is_train)
-    total_loss = 0.0
-    n_batches  = 0
-    tag = "TRAIN" if is_train else "VAL"
-
-    n_total = len(loader)
- 
-    ctx = torch.enable_grad if is_train else torch.no_grad
-    epoch_start = time.time()
-
-    with ctx():
-        iterable = tqdm(loader, desc=f"{tag} epoch {epoch}", unit="batch", leave=True, dynamic_ncols=True) if use_tqdm else loader
-
-        for batch in iterable:
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = compute_loss(model, batch, device, cfg)
- 
-            if is_train:
-                optimizer.zero_grad()
-                if not torch.isnan(loss) and not torch.isinf(loss):
-                    loss.backward()
-                    if cfg["grad_clip"]:
-                        nn.utils.clip_grad_norm_(
-                            [p for p in model.parameters() if p.requires_grad],
-                            cfg["grad_clip"],
-                        )
-                    optimizer.step()
-                else:
-                    log_handler.warning(f"Skipping optimizer step due to NaN/Inf loss at step {global_step}")
-                scheduler.step()
-                global_step += 1
-
- 
-                if global_step % cfg["log_every_n_steps"] == 0:
-                    lr = scheduler.get_last_lr()[0]
-                    grad_norm = _grad_norm(model)
-                    run = f"[{cfg['run_name']}] " if cfg["run_name"] else ""
-
-                    eta_str = ""
-                    if not use_tqdm:
-                        batches_done = n_batches + 1
-                        elapsed = time.time() - epoch_start
-                        secs_per_batch = elapsed / batches_done
-                        remaining = (n_total - batches_done) * secs_per_batch
-                        fmt = lambda s: f"{int(s)//60:02d}:{int(s)%60:02d}"
-                        eta_str = f"  {fmt(elapsed)}<{fmt(remaining)}"
-
-                    log_handler.info(
-                        f"{run}epoch {epoch} - batch {n_batches + 1}/{n_total} - step {global_step} | "
-                        f"loss {loss.item():.4f}  lr {lr:.2e}  grad_norm {grad_norm:.3f}{eta_str}"
-                    )
-                    # step-level metrics -- logged at every log_every_n_steps
-                    wandb_log({
-                        "train/loss":      loss.item(),
-                        "train/lr":        lr,
-                        "train/grad_norm": grad_norm,
-                    }, step=global_step, run=wandb_run)
- 
-            total_loss += loss.item()
-            n_batches  += 1
-
-            
- 
-    avg = total_loss / max(n_batches, 1)
-    log_handler.info(f"{tag} epoch {epoch} avg loss: {avg:.4f}")
-    return avg, global_step
 
 
 def train(cfg: Dict[str, Any], resume: bool = True) -> None:
@@ -290,7 +96,7 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
         train_loss, global_step = run_epoch(
             model, train_loader, optimizer, scheduler,
             device, cfg, epoch, global_step, wandb_run=wandb_run,
-            is_train=True, use_tqdm=True,
+            is_train=True, use_tqdm=False,
         )
 
         # epoch-level summary (step-level metrics are logged inside run_epoch)
@@ -324,7 +130,7 @@ def train(cfg: Dict[str, Any], resume: bool = True) -> None:
 # Entry point
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SCFAWithStyleHead from a JSON config.")
+    parser = argparse.ArgumentParser(description="Train GraphStyleGenerator from a JSON config.")
     parser.add_argument("--config",   required=True, help="Path to hyperparameter config JSON.")
     parser.add_argument("--override", nargs="*", metavar="KEY=VALUE",
                         help="Override individual config fields (e.g. --override learning_rate=1e-4).")

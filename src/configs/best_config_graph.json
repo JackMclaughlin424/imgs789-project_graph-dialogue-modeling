@@ -1,6 +1,7 @@
 {
     "h5_path": "data_TEMP/merged_audio_full.h5",
     "meta_path": "data_TEMP/merged_metadata_full.parquet",
+    "output_dir": "model_checkpoints",
     "_comment_param_section_dataset": "Dataset parameters",
     "sample_rate": 16000,
     "max_len_sec": 15,
@@ -25,9 +26,8 @@
     "num_prefix_tokens": 10,
     "system_prompt": "Speaking style:",
     "_comment_param_section_training": "Training parameters",
-    "run_name": "",
     "batch_size": 16,
-    "num_epochs": 15,
+    "num_epochs": 12,
     "learning_rate": 2e-4,
     "weight_decay": 25e-4,
     "dropout": 0.3,
@@ -40,6 +40,7 @@
     "seed": 42,
     "log_every_n_steps": 50,
     "_comment_param_section_wandb": "W&B settings",
-    "wandb_project": "imgs789-sweeps",
-    "wandb_entity": "jdm8943-rochester-institute-of-technology"
+    "wandb_project": "imgs789-final",
+    "wandb_entity": "jdm8943-rochester-institute-of-technology",
+    "run_name": "imgs789_final_train"
 }
