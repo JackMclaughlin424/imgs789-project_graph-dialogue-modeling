@@ -15,7 +15,12 @@ from capstone_src.style_prompt_generator.model.train_helpers import (
     assert_no_test_leakage, compute_bertscore, compute_meteor, compute_chrf, compute_rouge, compute_tag_f1,
     compute_dist, compute_pred_semantic_sim, _flatten,
     _load_tag_categories, _tags_present, _f1_sets,
+    # aliased capstone functions
+    build_model as build_transformer_model,
+    eval_test_by_source as transformer_eval_test_by_source,
+    load_config as load_transformer_config,
 )
+
 
 
 from graph_model.graph_model_helpers import (
@@ -264,7 +269,7 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, ana
             project=cfg["wandb_project"],
             entity=cfg.get("wandb_entity"),
             config={**cfg, "checkpoint": checkpoint_path, "run_type": "test", "dataset": src},
-            name=f"infer_test_{src}",
+            name=f"infer_graph_{src}",
             settings=wandb.Settings(console="off", init_timeout=300),
         )
 
@@ -293,29 +298,85 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, ana
     torch.cuda.empty_cache()
 
 
+def run_transformer_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, analysis_dir=None):
+    set_seed(cfg["seed"])
+
+    model = build_transformer_model(cfg, device, log)
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        model.load_state_dict(ckpt["model"])
+        log.info(f"Loaded transformer checkpoint: {checkpoint_path}  (epoch {ckpt.get('epoch')}, step {ckpt.get('step')})")
+    else:
+        model.load_state_dict(ckpt)
+        log.info(f"Loaded transformer model state_dict: {checkpoint_path}")
+    model.eval()
+
+    src_metrics, raw_outputs = transformer_eval_test_by_source(model, cfg, test_chains_by_source, device, log)
+
+    for src, src_m_dict in src_metrics.items():
+        run_test = wandb.init(
+            project=cfg["wandb_project"],
+            entity=cfg.get("wandb_entity"),
+            config={**cfg, "checkpoint": checkpoint_path, "run_type": "transformer_test", "dataset": src},
+            name=f"infer_transformer_{src}",
+            settings=wandb.Settings(console="off", init_timeout=300),
+        )
+
+        inference_time = src_m_dict.get("inference_time_s", 0.0)
+        log.info(
+            f"Transformer/{src}  bertscore_f1={src_m_dict['bertscore_f1']:.4f}  "
+            f"meteor={src_m_dict['meteor']:.4f}  chrf={src_m_dict['chrf']:.4f}  "
+            f"tag_f1={src_m_dict['tag_f1_overall']:.4f}"
+        )
+        summary = {f"transformer/{src}/{k}": v for k, v in src_m_dict.items()}
+        summary["trial/inference_time_s"] = inference_time
+        run_test.summary.update(summary)
+        wandb_log(summary, step=0, run=run_test)
+        run_test.finish()
+
+        if analysis_dir is not None:
+            preds, refs, texts, src_chains = raw_outputs[src]
+            device_str = str(device)
+            per_sample = _compute_per_sample_metrics(preds, refs, src, device_str)
+            chain_dicts = [[{"transcription": t} for t in chain] for chain in texts]
+            save_failure_analysis(preds, refs, src, per_sample, src_m_dict, analysis_dir, "transformer", chains=chain_dicts)
+
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained checkpoint on the test set (no training)."
+        description="Evaluate trained checkpoints on the test set (no training)."
     )
     parser.add_argument("--config",       required=True,
-                        help="Config JSON matching the one used during training.")
+                        help="Config JSON for the graph model.")
     parser.add_argument("--checkpoint",   required=True,
-                        help="Path to a saved model checkpoint (.pt file).")
+                        help="Path to a saved graph model checkpoint (.pt file).")
     parser.add_argument("--analysis_dir", default=None,
                         help="Directory to write per-sample failure analysis JSONs. Skipped if not set.")
+
+    parser.add_argument("--transformer_checkpoint", default=None,
+                        help="Path to a saved transformer (SCFA) model checkpoint (.pt file). Skipped if not set.")
+    parser.add_argument("--transformer_config", default=None,
+                        help="Config JSON for the transformer model. Required when --transformer_checkpoint is set.")
 
     parser.add_argument("--skip_baseline", action="store_true",
                         help="Skip the few-shot LLM baseline evaluation.")
     parser.add_argument("--override",     nargs="*", metavar="KEY=VALUE",
-                        help="Override base config fields.")
+                        help="Override graph model config fields.")
     args = parser.parse_args()
+
+    if args.transformer_checkpoint and not args.transformer_config:
+        parser.error("--transformer_config is required when --transformer_checkpoint is set.")
 
     with open(args.config) as f:
         cfg = json.load(f)
     apply_overrides(cfg, args.override)
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     log.info(f"Checkpoint: {args.checkpoint}")
@@ -346,11 +407,18 @@ def main():
 
     run_inference_trial(cfg, args.checkpoint, test_chains_by_source, device, analysis_dir=args.analysis_dir)
 
+    if args.transformer_checkpoint:
+        transformer_cfg = load_transformer_config(args.transformer_config)
+        log.info(f"Transformer checkpoint: {args.transformer_checkpoint}")
+        log.info(f"Transformer config: {json.dumps(transformer_cfg, indent=2, default=str)}")
+        run_transformer_inference_trial(transformer_cfg, args.transformer_checkpoint, test_chains_by_source, device)
+
     if not args.skip_baseline:
         run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device, analysis_dir=args.analysis_dir)
 
     gc.collect()
     torch.cuda.empty_cache()
+
 
 
 
