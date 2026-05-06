@@ -414,7 +414,7 @@ def main():
         transformer_cfg = load_transformer_config(args.transformer_config)
         log.info(f"Transformer checkpoint: {args.transformer_checkpoint}")
         log.info(f"Transformer config: {json.dumps(transformer_cfg, indent=2, default=str)}")
-        run_transformer_inference_trial(transformer_cfg, args.transformer_checkpoint, test_chains_by_source, device)
+        run_transformer_inference_trial(transformer_cfg, args.transformer_checkpoint, test_chains_by_source, device, analysis_dir=args.analysis_dir)
 
     if not args.skip_baseline:
         run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device, analysis_dir=args.analysis_dir)
