@@ -42,6 +42,6 @@
     "seed": 42,
     "log_every_n_steps": 50,
     "_comment_param_section_wandb": "W&B settings",
-    "wandb_project": "final-style-prompt-gen",
+    "wandb_project": "imgs789_inference",
     "wandb_entity": "jdm8943-rochester-institute-of-technology"
 }

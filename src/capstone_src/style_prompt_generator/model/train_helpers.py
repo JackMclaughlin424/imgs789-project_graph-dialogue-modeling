@@ -741,7 +741,7 @@ def eval_test_by_source(
     loader_kw = dict(collate_fn=collate_pad, num_workers=cfg["num_workers"], pin_memory=True)
 
     source_metrics = {}
-
+    raw_outputs    = {}
     for src, src_chains in test_chains_by_source.items():
         test_ds = ConvoStyleDataset.from_prebuilt_chains(
             chains=src_chains,
@@ -844,6 +844,7 @@ def eval_test_by_source(
             "inference_time_s":  inference_time,
         }
 
+        raw_outputs[src] = (all_preds, all_refs, all_texts, src_chains)
 
 
 
@@ -857,7 +858,8 @@ def eval_test_by_source(
     gc.collect()
     torch.cuda.empty_cache()
 
-    return source_metrics
+    return source_metrics, raw_outputs
+
 
 
 def assert_no_test_leakage(trainval_ids: set, test_conv_ids: set) -> None:
