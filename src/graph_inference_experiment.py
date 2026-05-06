@@ -291,7 +291,7 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, ana
             device_str = str(device)
             per_sample = _compute_per_sample_metrics(preds, refs, src, device_str)
             chain_dicts = [[{"transcription": t} for t in chain] for chain in texts]
-            save_failure_analysis(preds, refs, src, per_sample, src_m_dict, analysis_dir, "test", chains=chain_dicts)
+            save_failure_analysis(preds, refs, src, per_sample, src_m_dict, analysis_dir, "graph", chains=chain_dicts)
 
     del model
     gc.collect()
