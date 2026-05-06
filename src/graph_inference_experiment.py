@@ -14,7 +14,9 @@ from capstone_src.style_prompt_generator.model.train_helpers import (
     wandb_log,
     assert_no_test_leakage, compute_bertscore, compute_meteor, compute_chrf, compute_rouge, compute_tag_f1,
     compute_dist, compute_pred_semantic_sim, _flatten,
+    _load_tag_categories, _tags_present, _f1_sets,
 )
+
 
 from graph_model.graph_model_helpers import (
     build_model, eval_test_by_source
@@ -40,6 +42,84 @@ logging.getLogger().addHandler(_fh)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
+
+def _compute_per_sample_metrics(predictions, ground_truths, src, device_str):
+    from bert_score import score as _bert_score
+    from sacrebleu.metrics import CHRF as _CHRF
+    from rouge_score import rouge_scorer as _rouge_scorer
+    import nltk
+    from nltk.translate.meteor_score import meteor_score as _meteor
+
+    _, _, F1 = _bert_score(predictions, ground_truths, lang="en", device=device_str, verbose=False)
+    bs_scores = F1.tolist()
+
+    chrf_scorer  = _CHRF(word_order=2)
+    rouge_scorer = _rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    try:
+        nltk.data.find("corpora/wordnet")
+    except LookupError:
+        nltk.download("wordnet", quiet=True)
+
+    categories = _load_tag_categories(src)
+
+    records = []
+    for i, (pred, ref) in enumerate(zip(predictions, ground_truths)):
+        pred_tags_by_cat, ref_tags_by_cat, tag_f1_by_cat = {}, {}, {}
+        all_pred_tags, all_ref_tags = set(), set()
+        for cat, pattern in categories.items():
+            pt = _tags_present(pattern, pred)
+            rt = _tags_present(pattern, ref)
+            pred_tags_by_cat[cat] = sorted(pt)
+            ref_tags_by_cat[cat]  = sorted(rt)
+            tag_f1_by_cat[cat]    = _f1_sets(pt, rt)
+            all_pred_tags |= pt
+            all_ref_tags  |= rt
+
+        records.append({
+            "bertscore_f1":        bs_scores[i],
+            "meteor":              _meteor([ref.split()], pred.split()),
+            "chrf":                chrf_scorer.sentence_score(pred, [ref]).score / 100.0,
+            "rougeL":              rouge_scorer.score(ref, pred)["rougeL"].fmeasure,
+            "tag_f1_overall":      _f1_sets(all_pred_tags, all_ref_tags),
+            "tag_f1_by_category":  tag_f1_by_cat,
+            "pred_tags":           sorted(all_pred_tags),
+            "ref_tags":            sorted(all_ref_tags),
+            "missed_tags":         sorted(all_ref_tags - all_pred_tags),
+            "hallucinated_tags":   sorted(all_pred_tags - all_ref_tags),
+        })
+    return records
+
+
+def save_failure_analysis(predictions, ground_truths, src, per_sample_metrics, corpus_metrics, analysis_dir, run_type, chains=None):
+    """Write a JSON of per-sample predictions, references, and metrics for offline failure analysis."""
+    os.makedirs(analysis_dir, exist_ok=True)
+
+    samples = []
+    for i, (pred, ref, m) in enumerate(zip(predictions, ground_truths, per_sample_metrics)):
+        record = {"idx": i, "prediction": pred, "reference": ref, **m}
+        if chains is not None:
+            record["dialogue"] = [t.get("transcription", "") for t in chains[i] if t.get("transcription")]
+        samples.append(record)
+
+    # sort by worst meteor so failure cases appear first
+    samples.sort(key=lambda r: r["meteor"])
+    for rank, s in enumerate(samples):
+        s["failure_rank"] = rank
+
+    out = {
+        "source":          src,
+        "run_type":        run_type,
+        "n_samples":       len(samples),
+        "corpus_metrics":  corpus_metrics,
+        "samples":         samples,
+    }
+    path = os.path.join(analysis_dir, f"{run_type}_{src}_failure_analysis.json")
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2, default=str)
+    log.info(f"Failure analysis saved: {path}")
+
+
 
 
 def build_fewshot_set(train_ds, shuffled, cfg, num_few_shot):
@@ -79,7 +159,8 @@ def build_fewshot_set(train_ds, shuffled, cfg, num_few_shot):
     return few_shot_chains
 
 
-def run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device):
+def run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device, analysis_dir=None):
+
     num_few_shot         = cfg.get("num_few_shot", 25)
     max_new_tokens       = cfg.get("max_new_tokens", 80)
     inference_batch_size = cfg.get("inference_batch_size", 16)
@@ -141,6 +222,10 @@ def run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device):
         all_metrics = {**_flatten(bs_metrics), **_flatten(met_metrics), **_flatten(chrf_metrics), **_flatten(rouge_metrics), **_flatten(tag_metrics), **div_metrics, **psem_metrics}
         all_metrics["inference_time_s"] = inference_time
 
+        if analysis_dir is not None:
+            per_sample = _compute_per_sample_metrics(predictions, ground_truths, src, device_str)
+            save_failure_analysis(predictions, ground_truths, src, per_sample, all_metrics, analysis_dir, "baseline", chains=chains)
+
         log.info(
             f"Baseline/{src}  bertscore_f1={all_metrics['bertscore_f1']:.4f}  "
             f"meteor={all_metrics['meteor']:.4f}  chrf={all_metrics['chrf']:.4f}  "
@@ -151,6 +236,7 @@ def run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device):
         wandb_log(summary, step=0, run=run_baseline)
         run_baseline.finish()
 
+
     del llm, tokenizer
     gc.collect()
     if device_str == "cuda":
@@ -158,8 +244,7 @@ def run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device):
 
 
 
-def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device):
-    """Load a trained checkpoint once, then evaluate each source under its own wandb run."""
+def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, analysis_dir=None):
     set_seed(cfg["seed"])
 
     model = build_model(cfg, device, log)
@@ -172,7 +257,9 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device):
         log.info(f"Loaded final model state_dict: {checkpoint_path}")
     model.eval()
 
-    for src, chains in test_chains_by_source.items():
+    src_metrics, raw_outputs = eval_test_by_source(model, cfg, test_chains_by_source, device, log)
+
+    for src, src_m_dict in src_metrics.items():
         run_test = wandb.init(
             project=cfg["wandb_project"],
             entity=cfg.get("wandb_entity"),
@@ -181,24 +268,30 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device):
             settings=wandb.Settings(console="off", init_timeout=300),
         )
 
-        src_metrics = eval_test_by_source(model, cfg, {src: chains}, device, log)
-        src_m = src_metrics[src]
-        inference_time = src_m.get("inference_time_s", 0.0)
-
+        inference_time = src_m_dict.get("inference_time_s", 0.0)
         log.info(
-            f"Test/{src}  bertscore_f1={src_m['bertscore_f1']:.4f}  "
-            f"meteor={src_m['meteor']:.4f}  chrf={src_m['chrf']:.4f}  "
-            f"tag_f1={src_m['tag_f1_overall']:.4f}"
+            f"Test/{src}  bertscore_f1={src_m_dict['bertscore_f1']:.4f}  "
+            f"meteor={src_m_dict['meteor']:.4f}  chrf={src_m_dict['chrf']:.4f}  "
+            f"tag_f1={src_m_dict['tag_f1_overall']:.4f}"
         )
-        summary = {f"test/{src}/{k}": v for k, v in src_m.items()}
+        summary = {f"test/{src}/{k}": v for k, v in src_m_dict.items()}
         summary["trial/inference_time_s"] = inference_time
         run_test.summary.update(summary)
         wandb_log(summary, step=0, run=run_test)
         run_test.finish()
 
+        if analysis_dir is not None:
+            preds, refs, texts, src_chains = raw_outputs[src]
+            device_str = str(device)
+            per_sample = _compute_per_sample_metrics(preds, refs, src, device_str)
+            # reconstruct chain dicts for dialogue context
+            chain_dicts = [[{"transcription": t} for t in chain] for chain in texts]
+            save_failure_analysis(preds, refs, src, per_sample, src_m_dict, analysis_dir, "test", chains=chain_dicts)
+
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
 
 
 
@@ -210,6 +303,9 @@ def main():
                         help="Config JSON matching the one used during training.")
     parser.add_argument("--checkpoint",   required=True,
                         help="Path to a saved model checkpoint (.pt file).")
+    parser.add_argument("--analysis_dir", default=None,
+                        help="Directory to write per-sample failure analysis JSONs. Skipped if not set.")
+
     parser.add_argument("--skip_baseline", action="store_true",
                         help="Skip the few-shot LLM baseline evaluation.")
     parser.add_argument("--override",     nargs="*", metavar="KEY=VALUE",
@@ -248,10 +344,10 @@ def main():
     shuffled = trainval_arr.copy()
     rng.shuffle(shuffled)
 
-    run_inference_trial(cfg, args.checkpoint, test_chains_by_source, device)
+    run_inference_trial(cfg, args.checkpoint, test_chains_by_source, device, analysis_dir=args.analysis_dir)
 
     if not args.skip_baseline:
-        run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device)
+        run_baseline_for_trial(cfg, shuffled, test_chains_by_source, device, analysis_dir=args.analysis_dir)
 
     gc.collect()
     torch.cuda.empty_cache()
