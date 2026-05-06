@@ -262,9 +262,7 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, ana
         log.info(f"Loaded final model state_dict: {checkpoint_path}")
     model.eval()
 
-    src_metrics, raw_outputs = eval_test_by_source(model, cfg, test_chains_by_source, device, log)
-
-    for src, src_m_dict in src_metrics.items():
+    for src, chains in test_chains_by_source.items():
         run_test = wandb.init(
             project=cfg["wandb_project"],
             entity=cfg.get("wandb_entity"),
@@ -272,6 +270,9 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, ana
             name=f"infer_graph_{src}",
             settings=wandb.Settings(console="off", init_timeout=300),
         )
+
+        src_metrics, raw_outputs = eval_test_by_source(model, cfg, {src: chains}, device, log)
+        src_m_dict = src_metrics[src]
 
         inference_time = src_m_dict.get("inference_time_s", 0.0)
         log.info(
@@ -289,13 +290,13 @@ def run_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, ana
             preds, refs, texts, src_chains = raw_outputs[src]
             device_str = str(device)
             per_sample = _compute_per_sample_metrics(preds, refs, src, device_str)
-            # reconstruct chain dicts for dialogue context
             chain_dicts = [[{"transcription": t} for t in chain] for chain in texts]
             save_failure_analysis(preds, refs, src, per_sample, src_m_dict, analysis_dir, "test", chains=chain_dicts)
 
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
 
 
 def run_transformer_inference_trial(cfg, checkpoint_path, test_chains_by_source, device, analysis_dir=None):
@@ -311,9 +312,7 @@ def run_transformer_inference_trial(cfg, checkpoint_path, test_chains_by_source,
         log.info(f"Loaded transformer model state_dict: {checkpoint_path}")
     model.eval()
 
-    src_metrics, raw_outputs = transformer_eval_test_by_source(model, cfg, test_chains_by_source, device, log)
-
-    for src, src_m_dict in src_metrics.items():
+    for src, chains in test_chains_by_source.items():
         run_test = wandb.init(
             project=cfg["wandb_project"],
             entity=cfg.get("wandb_entity"),
@@ -321,6 +320,9 @@ def run_transformer_inference_trial(cfg, checkpoint_path, test_chains_by_source,
             name=f"infer_transformer_{src}",
             settings=wandb.Settings(console="off", init_timeout=300),
         )
+
+        src_metrics, raw_outputs = transformer_eval_test_by_source(model, cfg, {src: chains}, device, log)
+        src_m_dict = src_metrics[src]
 
         inference_time = src_m_dict.get("inference_time_s", 0.0)
         log.info(
@@ -344,6 +346,7 @@ def run_transformer_inference_trial(cfg, checkpoint_path, test_chains_by_source,
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
 
 
 
