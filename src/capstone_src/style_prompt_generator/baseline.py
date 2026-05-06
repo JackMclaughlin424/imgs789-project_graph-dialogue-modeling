@@ -21,8 +21,8 @@ import torch
 import wandb
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from dataset.ConvoStyleDataset import ConvoStyleDataset
-from model.train_helpers import compute_bertscore, compute_meteor, compute_chrf, compute_rouge, compute_tag_f1
+from capstone_src.style_prompt_generator.dataset.ConvoStyleDataset import ConvoStyleDataset
+from capstone_src.style_prompt_generator.model.train_helpers import compute_bertscore, compute_meteor, compute_chrf, compute_rouge, compute_tag_f1
 
 from tqdm import tqdm
 
